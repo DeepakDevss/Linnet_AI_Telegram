@@ -1,8 +1,0 @@
-python-telegram-bot>=22.0
-google-genai>=1.0
-httpx
-tzdata
-# Optional but recommended: gives a bundled ffmpeg so TTS replies arrive as a
-# real Telegram VOICE note (OGG/Opus). Without it, the bot still sends the audio
-# as a normal audio file. Remove this line if you want a lighter build.
-imageio-ffmpeg>=0.4.9
