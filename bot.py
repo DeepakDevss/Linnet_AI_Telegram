@@ -207,6 +207,7 @@ LANG_LABEL = {
 }
 LANG_CODE = {"hindi": "hi-in", "hinglish": "hi-in", "english": "en-in"}
 CHAT_LANG: dict = {}
+CHAT_LAST_REACT: dict = {}   # chat_id -> the last reaction we set (so the next one varies)
 VOICE_CHATS: set = set()
 
 
@@ -339,18 +340,39 @@ SYSTEM_PROMPT = (
     "- but NOT the full member list. You cannot change group settings or perform admin actions.\n"
     "- If a request is outside what you can do, say so briefly and offer what you can.\n"
     "\n"
-    "=== LAYER 7 — REACTION TAG (decide a fitting emoji every time) ===\n"
-    "Begin EVERY reply with a reaction tag on its own first line, in EXACTLY this format:\n"
-    "[react:EMOJI]\n"
-    "where EMOJI is ONE emoji from this list that best fits the MEANING and mood of the user's "
-    "message, or the single word none if no emoji genuinely fits: "
-    "👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 😢 🎉 🤩 🙏 👌 🤡 💯 🤣 ⚡ 🏆 💔 🤨 🧐 😴 😭 👀 😇 🤝 🤗 🗿 😎 🆒 💘 😘 🙈 🤷 😡 😈 💅 🫡\n"
-    "Choose by MEANING, not at random: a joke -> 😁 or 🤣; good news -> 🎉 or 🔥; a question -> 🤔; "
-    "thanks -> 🙏; praise -> 👏; a beautiful photo -> 😍 or 🔥; something sad or a mistake -> 😢; "
-    "surprising -> 🤯; a plan -> 🤝. Use none for plain, serious or purely factual messages. Never "
-    "reuse the same emoji every time. Put the tag on its own first line and nothing before it. After "
-    "the tag line, write your normal reply. The tag line is removed before the user sees it - never "
-    "mention it or repeat it.\n"
+    "=== LAYER 7 — REACTION (your emotional reflex) ===\n"
+    "Start EVERY reply with one tag on its own first line, exactly: [react:EMOJI]\n"
+    "That emoji is your INSTANT emotional reaction to what the person just said - the way a "
+    "friend's face reacts before they speak. It is set as a reaction on THEIR message, and the tag "
+    "line is removed before they see it, so never mention or repeat it.\n"
+    "Choose it in three steps, every time:\n"
+    "  1) What FEELING is the person showing? (joy, humour, sadness, surprise, pride, thanks, "
+    "worry, anger, love, teasing, curiosity - or nothing at all)\n"
+    "  2) Pick the ONE emoji that matches that feeling - the FEELING, not the topic.\n"
+    "  3) If the message is plain, factual, serious or purely informational, write none. Reacting "
+    "to everything feels robotic, so be willing to use none.\n"
+    "Feeling -> emoji (these are the ONLY allowed emojis):\n"
+    "  happy / good news / excited -> 🎉 🥰 😁 🤩 🔥 😍\n"
+    "  funny / joke / teasing -> 🤣 😁 🤡 🙈\n"
+    "  love / affection -> ❤ 💘 😘 🥰 🤗 😍\n"
+    "  thanks / gratitude -> 🙏 🤝\n"
+    "  praise / well done -> 👏 🏆 💯 🔥 👌\n"
+    "  sad / loss / bad news -> 😢 💔 😭\n"
+    "  surprise / shocking -> 🤯 😱 ⚡\n"
+    "  thinking / doubt / confused -> 🤔 🤨 🧐 🤷\n"
+    "  agreement / deal / plan -> 🤝 👌 🫡\n"
+    "  cool / stylish -> 😎 🆒 🗿\n"
+    "  angry / unfair -> 😡 (sparingly)\n"
+    "  bored / sleepy -> 😴 (sparingly)\n"
+    "  cheeky / mischievous -> 😈 💅\n"
+    "  noticed something -> 👀\n"
+    "  innocent / sweet -> 😇 🙈\n"
+    "  dislike / disappointed -> 👎 💔\n"
+    "Rules: ONE emoji only - never two, never any text inside the tag. Vary it: do not send the "
+    "same emoji twice in a row in a chat unless it truly fits again (the context tells you your "
+    "last reaction - use it to vary). Match the strength - a small thing gets a mild emoji, a big "
+    "thing a strong one. A wrong reaction is worse than none, so never pick a random or generic "
+    "emoji just to fill the tag.\n"
     "\n"
     "=== LAYER 8 — OUTPUT & TONE ===\n"
     "- Short paragraphs separated by blank lines. Bullet points where helpful. Bold key words with "
@@ -1046,6 +1068,10 @@ async def build_context(u: Update, bot, lang: str, media_state: str = "none",
                 lines.append(cs)
         except Exception as e:  # noqa: BLE001
             log.debug("memory summary failed: %s", e)
+    last_react = CHAT_LAST_REACT.get(chat.id)
+    if last_react:
+        lines.append(f"Your last reaction in this chat was {last_react} - choose a different one "
+                     f"unless {last_react} genuinely fits again.")
     if is_owner(user):
         lines.append("IMPORTANT: this person IS your OWNER - the bot's creator (Deepak). Treat them "
                      "as the boss: be extra helpful and a little more relaxed, but never change your "
@@ -1414,6 +1440,7 @@ async def ask_gemini_stream(chat_id, prompt_text: str, context: str,
                     reacted = True
                     if emoji:
                         await react_with(message, emoji)
+                        CHAT_LAST_REACT[chat_id_int] = emoji
             now = time.monotonic()
             if acc != last_sent and now - last_push >= STREAM_INTERVAL:
                 shown = strip_tag_partial(acc)[:TG_TEXT_LIMIT]
@@ -1986,6 +2013,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 emoji = find_reaction(ans)
                 if emoji:
                     await react_with(msg, emoji)
+                    CHAT_LAST_REACT[chat_id] = emoji
             clean = clean_reply(ans)
             if not clean:
                 clean = ans.strip() if ans.strip() else "✅"
