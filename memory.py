@@ -15,11 +15,14 @@ NOTE: Render's disk is ephemeral, so this file resets on a redeploy. To keep it
 across deploys, mount a Render Disk (or set MEMORY_FILE to a persistent path).
 """
 
+import copy
 import json
 import logging
 import os
 import threading
 import time
+
+_log = logging.getLogger("linnet")
 
 MEMORY_FILE = (os.environ.get("MEMORY_FILE") or
                os.path.join(os.path.dirname(os.path.abspath(__file__)), "linnet_memory.json"))
@@ -59,8 +62,12 @@ def load() -> None:
             _DATA["chats"] = raw.get("chats", {}) or {}
     except FileNotFoundError:
         pass
-    except Exception:
-        pass
+    except json.JSONDecodeError as e:
+        # A corrupt file used to vanish silently - the user just lost all memory with no
+        # clue why. Say so loudly, then carry on with an empty store.
+        _log.error("memory file is corrupt (%s) - starting fresh: %s", MEMORY_FILE, e)
+    except Exception as e:  # noqa: BLE001
+        _log.error("memory load failed (%s) - starting fresh: %s", MEMORY_FILE, e)
 
 
 def save() -> None:
@@ -92,45 +99,49 @@ def remember_user(user, chat_id=None, lang=None, chat_type=None) -> None:
     if not uid:
         return
     load()
+    # Everything happens INSIDE the lock. Previously the entry was fetched under the lock and
+    # then mutated outside it, so two concurrent updates could clobber each other.
     with _LOCK:
         u = _DATA["users"].setdefault(uid, {})
-    _touch(u)
-    u["name"] = getattr(user, "full_name", None) or u.get("name") or "?"
-    u["first"] = getattr(user, "first_name", None) or u.get("first", "")
-    if getattr(user, "username", None):
-        u["username"] = user.username
-    if lang:
-        u["language"] = lang
-    u.setdefault("likes", [])
-    u.setdefault("ai", {})
-    u.setdefault("chats", [])
-    if chat_id is not None:
-        cid = str(chat_id)
-        if cid not in u["chats"]:
-            u["chats"].append(cid)
-            if MAX_CHATS_PER_USER:
-                u["chats"] = u["chats"][-MAX_CHATS_PER_USER:]
-    if chat_type:
-        u["last_chat_type"] = chat_type
+        _touch(u)
+        u["name"] = getattr(user, "full_name", None) or u.get("name") or "?"
+        u["first"] = getattr(user, "first_name", None) or u.get("first", "")
+        if getattr(user, "username", None):
+            u["username"] = user.username
+        if lang:
+            u["language"] = lang
+        u.setdefault("likes", [])
+        u.setdefault("ai", {})
+        u.setdefault("chats", [])
+        if chat_id is not None:
+            cid = str(chat_id)
+            if cid not in u["chats"]:
+                u["chats"].append(cid)
+                if MAX_CHATS_PER_USER:
+                    u["chats"] = u["chats"][-MAX_CHATS_PER_USER:]
+        if chat_type:
+            u["last_chat_type"] = chat_type
     save()
 
 
 def note(user_id, text: str) -> bool:
     """Add a short fact about a user (deduped, capped). Returns True if stored."""
-    text = (text or "").strip().replace("\n", " ")[:MAX_NOTE_LEN]
+    text = (text or "").strip().replace("\n", " ")
+    if len(text) > MAX_NOTE_LEN:                 # cut on a word, not mid-word
+        text = text[:MAX_NOTE_LEN - 3].rstrip() + "..."
     if not text or user_id is None:
         return False
     load()
     uid = str(user_id)
     with _LOCK:
         u = _DATA["users"].setdefault(uid, {})
-    likes = u.setdefault("likes", [])
-    low = {x.lower() for x in likes}
-    if text.lower() in low:
-        return False
-    likes.append(text)
-    if MAX_NOTES and len(likes) > MAX_NOTES:
-        del likes[0:len(likes) - MAX_NOTES]
+        likes = u.setdefault("likes", [])
+        low = {x.lower() for x in likes}
+        if text.lower() in low:
+            return False
+        likes.append(text)
+        if MAX_NOTES and len(likes) > MAX_NOTES:
+            del likes[0:len(likes) - MAX_NOTES]
     save()
     return True
 
@@ -276,4 +287,5 @@ def forget(user_id) -> bool:
 
 def export() -> dict:
     load()
-    return json.loads(json.dumps(_DATA))
+    with _LOCK:
+        return copy.deepcopy(_DATA)

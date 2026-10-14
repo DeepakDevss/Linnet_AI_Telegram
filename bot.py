@@ -151,16 +151,26 @@ TTS_STYLE = os.environ.get("TTS_STYLE", "").strip() or (
     "at commas and full stops, light natural intonation (not flat, not sing-song). Friendly "
     "and modern - never loud, never breathy or whispery, never robotic, never monotone.")
 
-LOG_LINES = 40                # how many "Name: what" lines to remember per chat
-LOG_LINE_CHARS = 300          # cap each remembered line
-RECENT_CHAT_CHARS = 3500      # TOTAL cap for the transcript sent to the model each turn
-                              # (40 x 400 was up to 16k chars of input on EVERY reply = slow)
+LOG_LINES = int(os.environ.get("LOG_LINES", "40") or "40")          # lines kept per chat
+LOG_LINE_CHARS = int(os.environ.get("LOG_LINE_CHARS", "300") or "300")   # cap per line
+RECENT_CHAT_CHARS = int(os.environ.get("RECENT_CHAT_CHARS", "3500") or "3500")
+# ^ TOTAL cap for the transcript sent to the model each turn (40 x 400 was up to 16k
+#   chars of input on EVERY reply, which was a direct cause of slow answers).
 CALL_TIMEOUT = 30             # fail over to the next model faster
 TTS_TIMEOUT = 60
 ENABLE_STREAM = (os.environ.get("ENABLE_STREAM", "true").strip().lower()
                  not in ("0", "false", "no", "off"))
 GROUP_MODE = os.environ.get("GROUP_MODE", "all").strip().lower()   # all | mention
 STREAM_INTERVAL = 0.9
+# Streaming had NO timeout at all - one hung model meant the user waited forever. These
+# bound the wait: give up on the first token quickly (the normal path then walks the whole
+# model chain), and stop mid-stream if a chunk stalls.
+FIRST_TOKEN_TIMEOUT = float(os.environ.get("FIRST_TOKEN_TIMEOUT", "8") or "8")
+CHUNK_TIMEOUT = float(os.environ.get("CHUNK_TIMEOUT", "12") or "12")
+STREAM_TOTAL_TIMEOUT = float(os.environ.get("STREAM_TOTAL_TIMEOUT", "45") or "45")
+# Hard cap on reply length - generation time is proportional to it, and a rambling reply
+# was the single biggest cause of a long wait.
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "1600") or "1600")
 MAX_IMAGE_BYTES = 18 * 1024 * 1024
 MAX_AUDIO_BYTES = 20 * 1024 * 1024
 MAX_DOC_BYTES = 18 * 1024 * 1024
@@ -308,6 +318,10 @@ SYSTEM_PROMPT = (
     "=== LAYER 1 — IDENTITY (never changes) ===\n"
     "You are 'Linnet', a smart, helpful AI assistant created by Deepak. You live inside a "
     "Telegram bot and talk with people in private chats and in groups.\n"
+    "- About YOURSELF, avoid gendered first-person verb endings (sakta/sakti, karta/karti, "
+    "raha/rahi). Use a neutral rephrase instead: 'main ye kar sakti hoon' -> 'ye ho jayega'; "
+    "'main aapki madad kar sakta hoon' -> 'main aapki madad kar doonga' only if the USER is "
+    "male, otherwise 'aapki madad ho jayegi'. Simple and neutral beats gendered.\n"
     "\n"
     "=== LAYER 2 — LANGUAGE (highest priority after identity) ===\n"
     "You MUST reply in the SAME language and script the user just wrote in. This rule sits above "
@@ -316,6 +330,9 @@ SYSTEM_PROMPT = (
     "- User writes in Hindi using Devanagari (e.g. 'आप कैसे हैं')  -> reply in Hindi in Devanagari.\n"
     "- User writes in Hinglish, i.e. Hindi typed in Roman/English letters (e.g. 'kaise ho bhai')  "
     "-> reply in Hinglish in Roman letters. NEVER answer Hinglish in Devanagari.\n"
+    "- MIXED message (e.g. 'weather aaj kaisa hai?'): match the MAJORITY language. If it is "
+    "roughly 50/50, use Hinglish. A few English words inside a Hindi sentence still count as "
+    "Hinglish, not English.\n"
     "- Match the register too: casual stays casual, formal stays formal. Never switch first; if the "
     "user switches language, switch with them at once and stay switched.\n"
     "Examples (follow exactly):\n"
@@ -603,8 +620,17 @@ _SEND_TIMES: dict = defaultdict(deque)
 _KNOWN_LOADED = False
 
 
+# A user must not be able to poison the transcript the model reads: no faking the
+# 'Name: what they said' format, and no injecting our internal tags.
+_TAG_INJECT_RE = re.compile(r"\[(?:react|quote|remember|image)\s*:[^\]]*\]", re.I)
+_FAKE_NAME_RE = re.compile(r"^\s*[A-Za-z0-9_@.\- ]{1,32}:\s+")
+
+
 def log_line(chat_id: int, who: str, text: str) -> None:
-    text = re.sub(r"\s+", " ", (text or "").strip())[:LOG_LINE_CHARS]
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    text = _TAG_INJECT_RE.sub("", text)
+    text = _FAKE_NAME_RE.sub("", text)
+    text = text[:LOG_LINE_CHARS]
     if text:
         CHAT_LOG[chat_id].append((who, text))
 
@@ -1462,6 +1488,8 @@ def _gen_config(sys_instr: str, model: str = "", thinking: bool = True):
     source of reply delay. It is never allowed to be the reason a request fails: the
     caller retries the same model with no thinking config at all."""
     kw = {"system_instruction": sys_instr}
+    if MAX_OUTPUT_TOKENS > 0:
+        kw["max_output_tokens"] = MAX_OUTPUT_TOKENS
     if thinking and _thinking_allowed(model):
         try:
             if THINKING_LEVEL:
@@ -1779,7 +1807,31 @@ async def ask_gemini_stream(chat_id, prompt_text: str, context: str,
             model=smodel, contents=contents,
             config=_gen_config(sys_instr, smodel, True),
         )
-        async for chunk in stream:
+        # Watchdog: the stream had no timeout at all, so one hung/slow model made the user
+        # wait indefinitely. We now bound the first token, each later chunk, and the total.
+        ait = stream.__aiter__()
+        deadline = time.monotonic() + STREAM_TOTAL_TIMEOUT
+        first = True
+        while True:
+            if time.monotonic() > deadline:
+                log.warning("stream hit the %.0fs total cap - using what we have",
+                            STREAM_TOTAL_TIMEOUT)
+                break
+            try:
+                chunk = await asyncio.wait_for(
+                    ait.__anext__(), timeout=FIRST_TOKEN_TIMEOUT if first else CHUNK_TIMEOUT)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                if first:
+                    # Nothing arrived at all -> let the normal path walk the whole chain.
+                    log.warning("stream: no first token in %.0fs on %s - falling back",
+                                FIRST_TOKEN_TIMEOUT, smodel)
+                    _mark_fail(smodel, "no first token")
+                    return None
+                log.warning("stream stalled mid-reply - sending what we have")
+                break
+            first = False
             acc += (getattr(chunk, "text", "") or "")
             if not reacted:
                 emoji = find_reaction(acc)
@@ -2569,8 +2621,28 @@ async def on_chat_member(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         await send_welcome(c.bot, cm.chat.id, member)
 
 
+_ERR_TOLD: dict = {}
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch-all for anything a handler throws. Before, an unexpected exception killed the
+    update silently and the person just got no reply. Now we log it AND tell them once
+    (throttled per chat) so a failure never looks like the bot ignoring them."""
     log.error("Update error: %s", context.error, exc_info=context.error)
+    if isinstance(context.error, RetryAfter):
+        return
+    msg = getattr(update, "effective_message", None) if update is not None else None
+    chat = getattr(update, "effective_chat", None) if update is not None else None
+    if msg is None or chat is None:
+        return
+    now = time.time()
+    if now - _ERR_TOLD.get(chat.id, 0.0) < 60:
+        return
+    _ERR_TOLD[chat.id] = now
+    try:
+        await msg.reply_text("Kuch technical issue aa gaya. Ek baar dobara bhejo.")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _cleanup_loop() -> None:
