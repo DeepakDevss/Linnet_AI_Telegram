@@ -93,11 +93,15 @@ for _gm in _groq_chain:
         GROQ_MODELS.append(_gm)
 
 _models_env = os.environ.get("GEMINI_MODELS", "").strip()
+# Ordered by FREE DAILY QUOTA, best first. Flash-Lite models get ~500 requests/day on
+# the free tier, while the plain Flash models (3.5/3.6/3.7/3.8) get only ~20/day - so
+# they are kept only as a last resort, otherwise they run out almost immediately.
 GEMINI_MODELS = [m.strip() for m in _models_env.split(",") if m.strip()] or [
-    "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
-    "gemini-3.6-flash",
-    "gemma-4-31b-it",
+    "gemini-3.5-flash-lite",   # ~500 RPD
+    "gemini-3.1-flash-lite",   # ~500 RPD
+    "gemma-4-31b-it",          # free-only tier (no paid tier at all)
+    "gemini-3.8-flash",        # ~20 RPD - last resort (best quality)
+    "gemini-3.6-flash",        # ~20 RPD - last resort
 ]
 if "gemini-flash-latest" not in GEMINI_MODELS:
     GEMINI_MODELS.append("gemini-flash-latest")
@@ -464,8 +468,9 @@ HTTP = httpx.AsyncClient(timeout=CALL_TIMEOUT)
 HTTP_STT = httpx.AsyncClient(timeout=90)
 CONCURRENT_UPDATES = int(os.environ.get("CONCURRENT_UPDATES", "16") or "16")
 _RATE_LIMITER_ON = False   # set True when PTB's AIORateLimiter is active
-_MODEL_RR = 0              # round-robin cursor over the model chain
+_MODEL_RR = 0              # start position in the chain
 _MODEL_COOLDOWN: dict = {}  # model -> epoch until which it is skipped (just failed)
+_LAST_GOOD = None          # the model that last answered - always tried first
 
 # ---- Image generation (Pollinations - free; key optional) ----
 IMAGE_ENABLED = os.environ.get("IMAGE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
@@ -1240,7 +1245,12 @@ def _model_order() -> list:
     n = len(GEMINI_MODELS)
     if n == 0:
         return []
-    start = _MODEL_RR % n
+    # Start from the model that last worked, so the good one is always tried first
+    # (plain round-robin kept landing on the ~20/day Flash models and failing).
+    if _LAST_GOOD in GEMINI_MODELS:
+        start = GEMINI_MODELS.index(_LAST_GOOD)
+    else:
+        start = _MODEL_RR % n
     order = [GEMINI_MODELS[(start + i) % n] for i in range(n)]
     now = time.time()
     return ([m for m in order if _MODEL_COOLDOWN.get(m, 0) <= now]
@@ -1248,9 +1258,12 @@ def _model_order() -> list:
 
 
 def _advance_rr(model: str) -> None:
-    global _MODEL_RR
+    """Remember the model that just worked - it is tried FIRST next time."""
+    global _MODEL_RR, _LAST_GOOD
+    if model:
+        _LAST_GOOD = model
     try:
-        _MODEL_RR = (GEMINI_MODELS.index(model) + 1) % max(1, len(GEMINI_MODELS))
+        _MODEL_RR = GEMINI_MODELS.index(model)
     except ValueError:
         _MODEL_RR = 0
 
