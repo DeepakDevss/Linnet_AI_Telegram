@@ -125,6 +125,24 @@ Issues and pull requests are welcome.
 
 ---
 
+## Related projects
+
+- **Ongoing Links** — A Telegram community bot with a force-join gate, welcome messages, referral tracking, and AI chat.
+  Repository: https://github.com/DeepakDevss/Telegram_Invited_AIBot
+  Bot: https://t.me/ANIME_WORLD_8BOT
+
+---
+
+## Author
+
+Deepak Devs
+
+- GitHub: https://github.com/DeepakDevss
+- X: https://x.com/Deepak_Devs
+- Reddit: https://www.reddit.com/u/Deepak_Devs
+
+---
+
 ## License
 
 There's no license file yet. Add one before you distribute or publicly modify this project.
