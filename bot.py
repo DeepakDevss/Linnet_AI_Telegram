@@ -478,6 +478,9 @@ IMAGE_SAFE = os.environ.get("IMAGE_SAFE", "true").strip().lower() in ("1", "true
 IMAGE_STYLE = os.environ.get("IMAGE_STYLE", "false").strip().lower() in ("1", "true", "yes", "on")
 IMAGE_COOLDOWN = int(os.environ.get("IMAGE_COOLDOWN", "15") or "15")
 IMAGE_REFERRER = os.environ.get("IMAGE_REFERRER", "linnet-ai").strip() or "linnet-ai"
+# Tertiary, no-key text fallback (used only when Gemini AND Groq both fail).
+POLLINATIONS_TEXT_URL = "https://text.pollinations.ai/openai"
+POLLINATIONS_TEXT_MODEL = os.environ.get("POLLINATIONS_TEXT_MODEL", "openai").strip() or "openai"
 _LAST_IMAGE: dict = {}       # chat_id -> epoch of the last image (cooldown)
 HTTP_IMG = httpx.AsyncClient(timeout=150)
 
@@ -1161,6 +1164,18 @@ async def ask_groq(system: str, messages: list) -> str:
     raise RuntimeError(last or "all Groq models failed")
 
 
+async def ask_pollinations(system: str, messages: list) -> str:
+    """Free, no-key text fallback (Pollinations). Last resort before a 'busy' reply."""
+    payload = {"model": POLLINATIONS_TEXT_MODEL,
+               "messages": [{"role": "system", "content": system}] + messages}
+    headers = {"Content-Type": "application/json"}
+    if POLLINATIONS_API_KEY:
+        headers["Authorization"] = f"Bearer {POLLINATIONS_API_KEY}"
+    r = await HTTP.post(POLLINATIONS_TEXT_URL, headers=headers, json=payload)
+    r.raise_for_status()
+    return (r.json()["choices"][0]["message"]["content"] or "").strip()
+
+
 # ============================ PART 13: AI CALL ============================
 def _user_parts(prompt_text: str, image=None, audio=None, doc=None):
     parts = [types.Part.from_text(text=prompt_text)]
@@ -1347,6 +1362,7 @@ async def _gemini_pass(contents, sys_instr):
     option can never be the reason a reply fails."""
     global _THINKING_OK
     last = ""
+    quota_hits = 0
     for model in _model_order():
         for thinking in (True, False):
             if thinking and not _thinking_allowed(model):
@@ -1366,11 +1382,21 @@ async def _gemini_pass(contents, sys_instr):
             except Exception as e:  # noqa: BLE001
                 last = str(e)
                 log.warning("%s (think=%s) failed: %s", model, thinking, last[:150])
-                if thinking and "404" not in last and "not found" not in last.lower():
+                quota = "429" in last or "RESOURCE_EXHAUSTED" in last
+                if (thinking and not quota and "404" not in last
+                        and "not found" not in last.lower()):
                     _THINKING_OK = False   # retry the SAME model without thinking
                     continue
                 _mark_fail(model, last)
-                await asyncio.sleep(0.2)
+                if quota:
+                    # Gemini quota is shared per PROJECT, so once two models say 429 the
+                    # rest will too - stop hammering and let Groq/Pollinations answer.
+                    quota_hits += 1
+                    if quota_hits >= 2:
+                        log.warning("Gemini quota looks exhausted - skipping the rest of the chain")
+                        return None, last
+                else:
+                    await asyncio.sleep(0.2)
                 break
     return None, last
 
@@ -1380,15 +1406,17 @@ async def ask_gemini(chat_id, prompt_text: str, context: str,
     contents = [types.Content(role="user", parts=_user_parts(prompt_text, image, audio, doc))]
     sys_instr = SYSTEM_PROMPT + "\n\n" + context
 
-    ans, last_err = None, "NOKEY"
+    ans, last_err, gem_err = None, "NOKEY", ""
     if client is not None:
-        ans, last_err = await _gemini_pass(contents, sys_instr)
+        ans, gem_err = await _gemini_pass(contents, sys_instr)
+        last_err = gem_err
     if ans:
         return ans
 
+    msgs = _to_groq_messages(contents)
     if GROQ_API_KEY:
         try:
-            g = await ask_groq(sys_instr, _to_groq_messages(contents))
+            g = await ask_groq(sys_instr, msgs)
             if g:
                 log.info("Answered via Groq fallback")
                 return g
@@ -1396,9 +1424,21 @@ async def ask_gemini(chat_id, prompt_text: str, context: str,
             last_err = str(e)
             log.warning("Groq failed: %s", str(e)[:150])
 
-    # Second pass - the loop: if EVERYTHING failed, wait a moment and walk the chain
-    # once more (a transient blip should not turn into a "busy" reply).
-    if client is not None:
+    # Tertiary fallback: free, no key. Better than a 'busy' reply.
+    try:
+        p = await ask_pollinations(sys_instr, msgs)
+        if p:
+            log.info("Answered via Pollinations fallback")
+            return p
+    except Exception as e:  # noqa: BLE001
+        last_err = str(e)
+        log.warning("Pollinations failed: %s", str(e)[:150])
+
+    # Second pass - the loop. Skipped when GEMINI hit a quota limit (retrying a spent
+    # quota a second later only burns more of it).
+    quota = ("429" in gem_err or "RESOURCE_EXHAUSTED" in gem_err
+             or "quota" in gem_err.lower())
+    if client is not None and not quota:
         await asyncio.sleep(1.0)
         ans2, last2 = await _gemini_pass(contents, sys_instr)
         if ans2:
@@ -2173,7 +2213,8 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
              f"🎙 ffmpeg: {'yes' if _ffmpeg_exe() else 'no (voice sent as audio)'}",
              f"🧠 Memory: {LOG_LINES} lines/chat",
              f"🎬 Streaming: {ENABLE_STREAM}",
-             f"👥 Group mode: {GROUP_MODE}"]
+             f"👥 Group mode: {GROUP_MODE}",
+             "--- live self-test (Gemini is primary, Groq secondary) ---"]
     if client is None:
         lines.append("❌ Gemini client not created (GEMINI_API_KEY missing).")
     else:
@@ -2185,7 +2226,20 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
                 lines.append(f"✅ {model}: OK" if (r.text or "").strip()
                              else f"⚠️ {model}: empty reply")
             except Exception as e:  # noqa: BLE001
-                lines.append(f"❌ {model}: {str(e)[:80]}")
+                lines.append(f"❌ {model}: {str(e)[:90]}")
+    if GROQ_API_KEY:
+        try:
+            g = await ask_groq("You are a test.", [{"role": "user", "content": "ping"}])
+            lines.append(f"✅ Groq: OK ({g[:20]})" if g else "⚠️ Groq: empty reply")
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"❌ Groq: {str(e)[:90]}")
+    else:
+        lines.append("⚠️ Groq: no GROQ_API_KEY set")
+    try:
+        p = await ask_pollinations("You are a test.", [{"role": "user", "content": "ping"}])
+        lines.append(f"✅ Pollinations: OK ({p[:20]})" if p else "⚠️ Pollinations: empty reply")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"❌ Pollinations: {str(e)[:90]}")
     await u.message.reply_text("\n".join(lines))
 
 
