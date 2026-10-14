@@ -108,15 +108,18 @@ GEMINI_MODELS = [m.strip() for m in _models_env.split(",") if m.strip()] or [
 if "gemini-flash-latest" not in GEMINI_MODELS:
     GEMINI_MODELS.append("gemini-flash-latest")
 
+# ORDER MATTERS. gemini-3.8-flash-tts is Google's studio-grade TTS (#1 on Hume AI's
+# Voice Design benchmark) - the OLD 2.5-flash-preview-tts was first here, which is exactly
+# why the voice sounded dated. Newest/best first, older only as a fallback.
 _tts_env = os.environ.get("TTS_MODELS", "").strip()
 TTS_MODELS = [m.strip() for m in _tts_env.split(",") if m.strip()] or [
-    "gemini-2.5-flash-preview-tts",
     "gemini-3.8-flash-tts",
     "gemini-3.8-flash-lite-tts",
+    "gemini-2.5-flash-preview-tts",
 ]
-# Achernar is Google's "Soft" voice: gentle and smooth with warmth and clarity - the
-# best match for a calm, friendly companion. (Aoede is "breezy", Kore "firm".)
-TTS_VOICE = os.environ.get("TTS_VOICE", "Achernar").strip() or "Achernar"
+# Leda is "warm, conversational" and the voice reviewers pick for chat agents/companions.
+# ('Soft' voices like Achernar are gentle but can sound quiet and dated over a chat.)
+TTS_VOICE = os.environ.get("TTS_VOICE", "Leda").strip() or "Leda"
 # All 30 prebuilt Gemini voices (name -> character). The user can change it with /setvoice.
 VOICE_NAMES = {
     "Zephyr": "Bright", "Puck": "Upbeat", "Charon": "Informative", "Kore": "Firm",
@@ -132,10 +135,10 @@ CHAT_VOICE: dict = {}   # chat_id -> voice name chosen with /setvoice
 TTS_TRANSLITERATE = (os.environ.get("TTS_TRANSLITERATE", "true").strip().lower()
                      not in ("0", "false", "no", "off"))
 TTS_STYLE = os.environ.get("TTS_STYLE", "").strip() or (
-    "Speak softly, warmly and clearly, like a real friend calmly explaining something - "
-    "gentle and unhurried, with a slight smile in the voice. Crisp, well-articulated "
-    "pronunciation so every word is easy to follow. Natural pauses between sentences. "
-    "Warm and reassuring, never loud, never robotic, never monotone, never rushed.")
+    "Speak like a warm, upbeat young friend talking naturally - clear, confident and easy to "
+    "follow, with a real smile in the voice. Natural conversational pacing with small pauses "
+    "at commas and full stops, light natural intonation (not flat, not sing-song). Friendly "
+    "and modern - never loud, never breathy or whispery, never robotic, never monotone.")
 
 LOG_LINES = 40                # how many "Name: what" lines to remember per chat
 LOG_LINE_CHARS = 400          # cap each remembered line
@@ -1199,6 +1202,20 @@ async def _chat_members_info(bot, chat) -> str:
     return txt
 
 
+def _find_member_id(chat_id, name):
+    """Find a member's user id by (partial) name, from the members we have already seen."""
+    name = (name or "").strip().lower()
+    if not name or len(name) < 2:
+        return None
+    found = None
+    for uid, nm in (MEMBERS.get(chat_id) or {}).items():
+        low = (nm or "").lower()
+        if low and (name == low or name in low.split() or name in low):
+            if found is None or len(nm) < len(MEMBERS[chat_id][found]):
+                found = uid
+    return found
+
+
 def _known_members_line(chat_id: int) -> str:
     names = list(MEMBERS.get(chat_id, {}).values())
     if not names:
@@ -1256,9 +1273,12 @@ async def build_context(u: Update, bot, lang: str, media_state: str = "none",
     elif media_state == "profile_bot":
         lines.append("The attached image is YOUR OWN profile picture / logo (they asked about it) - "
                      "look at it and describe it as your own avatar, warmly.")
+    elif media_state == "profile_other":
+        lines.append("The attached image is the PROFILE PICTURE of ANOTHER member of this chat "
+                     "(the user asked about that person) - describe it honestly and kindly.")
     elif media_state == "image_loaded":
-        lines.append("The user attached an IMAGE and it HAS been loaded for you - look at it and "
-                     "answer about it.")
+        lines.append("The user just SENT an image and it HAS been loaded for you - the image is "
+                     "THEIRS (they sent it), so never call it your own. Look at it and answer.")
     elif media_state == "image_failed":
         lines.append("The user attached an image but it could NOT be loaded - tell them honestly "
                      "and ask them to resend it.")
@@ -1468,6 +1488,11 @@ _ASK_MY_PHOTO_RE = re.compile(
     r"\b(?:meri|mera|my)\b[^.?!\n]{0,18}\b(?:photo|pic|dp|profile|avatar|display picture)\b"
     r"|\b(?:photo|pic|dp|profile|avatar)\b[^.?!\n]{0,18}"
     r"\b(?:dekh|dekho|dekhi|kaisi|kaisa|describe|batao|dikhao|dikh)\b", re.I)
+# "<name> ki profile pic" -> another member's avatar
+_ASK_OTHER_PHOTO_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9_.\-]{1,30})\s*(?:ki|ka|ke)\s+"
+    r"(?:profile|dp|photo|pic|picture|avatar|display picture)\b", re.I)
+_HIM_HER_RE = re.compile(r"^(?:us|uska|uski|unka|unki|his|her|their|that person)$", re.I)
 
 
 # Prompt cleaning + optional style boost (adapted from the Pollinations client you sent).
@@ -2262,6 +2287,20 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 _p = await fetch_profile_photo(c.bot, u.effective_user.id)
                 if _p:
                     pre_image = (_p, "image/jpeg", "profile_user")
+            else:
+                _m3 = _ASK_OTHER_PHOTO_RE.search(text)
+                if _m3:
+                    _name = _m3.group(1)
+                    _uid = None
+                    if _HIM_HER_RE.match(_name):
+                        _rtm = getattr(msg, "reply_to_message", None)
+                        _uid = _rtm.from_user.id if _rtm is not None and _rtm.from_user else None
+                    else:
+                        _uid = _find_member_id(chat_id, _name)
+                    if _uid and _uid != u.effective_user.id:
+                        _p = await fetch_profile_photo(c.bot, _uid)
+                        if _p:
+                            pre_image = (_p, "image/jpeg", "profile_other")
         except Exception as e:  # noqa: BLE001
             log.debug("profile photo lookup failed: %s", e)
     # Images are made ONLY through /image - normal messages never trigger one.
