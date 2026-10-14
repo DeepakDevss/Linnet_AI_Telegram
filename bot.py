@@ -301,9 +301,12 @@ SYSTEM_PROMPT = (
     "[remember: <a short fact>]. It is saved to their profile and removed before they see it. Use "
     "it only for real, lasting facts - never for small talk, and at most one per reply. Use "
     "what you remember naturally, but never read out a person's full private profile.\n"
-    "- QUOTE: if your answer is about ONE specific part of a longer message, you may add a tag "
-    "[quote: <the exact words, copied from their message>] to highlight that part. Copy it "
-    "EXACTLY, character for character - if you are not certain, leave the tag out.\n"
+    "- QUOTE (the reply-quote above your message): use [quote: <words copied from their message>] "
+    "ONLY when it truly helps - their message is long (2+ lines) AND your answer is about one "
+    "specific part of it, or they quoted a part themselves. Put it as the first tag and copy the "
+    "words EXACTLY, character for character. Do NOT use it for short messages, greetings, general "
+    "questions, or when the whole message is the topic - most replies should carry NO quote at "
+    "all. (To quote text inside your own message instead, start that line with '>' - see Layer 8.)\n"
     "\n"
     "=== LAYER 4 — CAPABILITIES (what you can do) ===\n"
     "- Chat naturally in English, Hindi and Hinglish; answer, explain, summarise, translate, write.\n"
@@ -384,16 +387,25 @@ SYSTEM_PROMPT = (
     "thing a strong one. A wrong reaction is worse than none, so never pick a random or generic "
     "emoji just to fill the tag.\n"
     "\n"
-    "=== LAYER 8 — OUTPUT & TONE ===\n"
-    "- Short paragraphs separated by blank lines. Bullet points where helpful. Bold key words with "
-    "**double asterisks**. Keep answers clear and practical.\n"
-    "- You are writing inside Telegram, so keep lines short and avoid long walls of text; open "
-    "with the answer itself, not a preamble.\n"
-    "- Friendly but natural and professional - NOT overly chatty or over-familiar.\n"
-    "- NEVER add honorifics like 'ji' after a name (write 'Deepak', never 'Deepak ji').\n"
-    "- Use emojis in the reply body only sparingly (0-1 per reply, mostly none).\n"
-    "- Refer to yourself in a NEUTRAL way (avoid gendered forms like 'sakti/sakta').\n"
-    "- Never use cringe phrases like 'shandar', 'kamaal', 'wow'."
+    "=== LAYER 8 — FORMATTING & TONE (you write inside Telegram) ===\n"
+    "Formatting that actually renders in Telegram - use it well, but do not overdo it:\n"
+    "- **bold** for the key word, the heading, or the single line that matters most. Not whole "
+    "sentences, and not every line.\n"
+    "- *italic* for a gentle emphasis or a title. Rarely.\n"
+    "- `code` for commands, file names, paths and IDs; a ```triple backtick``` block for code.\n"
+    "- '-' at the start of a line makes a bullet (it renders as •). Use bullets for 3+ items, "
+    "steps or options - not for a normal sentence.\n"
+    "- '>' at the start of a line makes a quote block. Use it when you are quoting a rule, a "
+    "definition, or some text back to them inside your own message.\n"
+    "- ~~strike~~ and ||spoiler|| also work; use them almost never.\n"
+    "- NEVER use Markdown tables, images, or '# ' headings - they do not render. Stick to the list "
+    "above.\n"
+    "Structure: short paragraphs with one blank line between them, and open with the answer itself "
+    "(no preamble). Keep it tight - people skim on Telegram.\n"
+    "Tone: friendly, natural and professional - not overly chatty. NEVER add honorifics like 'ji' "
+    "after a name (write 'Deepak', never 'Deepak ji'). Body emojis: 0-1 per reply, mostly none. "
+    "Refer to yourself in a NEUTRAL way (avoid gendered forms like 'sakti/sakta'). Never use cringe "
+    "phrases like 'shandar', 'kamaal', 'wow'."
     "\n"
     "=== LAYER 9 — THINKING & ACCURACY (think first, then answer) ===\n"
     "- Before answering, THINK silently: what is really being asked, what do I actually know, and "
@@ -608,15 +620,28 @@ def remember_member(chat_id: int, user) -> None:
 
 
 # ============================ PART 6: MARKDOWN -> TELEGRAM HTML ============================
+def _blockquote(m) -> str:
+    body = re.sub(r"(?m)^[ \t]*&gt;[ \t]?", "", m.group(0)).rstrip("\n")
+    return f"<blockquote>{body}</blockquote>"
+
+
 def md_to_html(text: str) -> str:
+    """Convert the model's Markdown into the HTML subset Telegram actually supports:
+    <b> <i> <s> <u> <code> <pre> <blockquote> <tg-spoiler>. Anything else is dropped
+    by Telegram, so nothing here should ever produce an unsupported tag."""
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # fenced code blocks first, so nothing inside them is reformatted
     text = re.sub(r"```[a-zA-Z0-9_+\-]*\n?(.*?)```",
                   lambda m: "<pre>" + m.group(1).rstrip("\n") + "</pre>", text, flags=re.S)
     text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+    # blockquote: one or more consecutive '>' lines (already escaped to &gt;)
+    text = re.sub(r"(?m)^(?:[ \t]*&gt;[^\n]*\n?)+", _blockquote, text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.S)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.S)
     text = re.sub(r"(?<!\*)\*(?!\*)(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", text)
     text = re.sub(r"(?<!\w)_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+    text = re.sub(r"\|\|(.+?)\|\|", r"<tg-spoiler>\1</tg-spoiler>", text)
     text = re.sub(r"(?m)^[ \t]*#{1,6}[ \t]*(.+?)[ \t]*$", r"<b>\1</b>", text)
     text = re.sub(r"(?m)^[ \t]*[*-][ \t]+", "\u2022 ", text)
     return text
