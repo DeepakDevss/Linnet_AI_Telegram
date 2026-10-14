@@ -673,17 +673,36 @@ def _blockquote(m) -> str:
     return f"<blockquote>{body}</blockquote>"
 
 
+def _stash_maker(stash: list):
+    def _keep(html: str) -> str:
+        stash.append(html)
+        return f"\x00{len(stash) - 1}\x00"
+    return _keep
+
+
 def md_to_html(text: str) -> str:
     """Convert the model's Markdown into the HTML subset Telegram actually supports:
-    <b> <i> <s> <u> <code> <pre> <blockquote> <tg-spoiler>. Anything else is dropped
-    by Telegram, so nothing here should ever produce an unsupported tag."""
+    <b> <i> <s> <code> <pre> <blockquote> <tg-spoiler>.
+
+    Code spans are moved behind placeholders FIRST. Before this, the bold/italic rules ran
+    over already-converted <code>...</code> and ate the markers inside it (e.g. the text
+    `**` produced '<code><b></code>' and left a stray '</b>'), which made the markup
+    mismatched - Telegram then rejected the whole message and we fell back to plain text,
+    so the user saw raw '**'. Placeholders fix that completely."""
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    # fenced code blocks first, so nothing inside them is reformatted
-    text = re.sub(r"```[a-zA-Z0-9_+\-]*\n?(.*?)```",
-                  lambda m: "<pre>" + m.group(1).rstrip("\n") + "</pre>", text, flags=re.S)
-    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+    stash: list = []
+    keep = _stash_maker(stash)
+    # fenced code (line-anchored, so an inline ``` is not mistaken for a fence)
+    text = re.sub(r"(?m)^[ \t]*```[a-zA-Z0-9_+\-]*\n?(.*?)^[ \t]*```[ \t]*$",
+                  lambda m: keep("<pre>" + m.group(1).rstrip("\n") + "</pre>"),
+                  text, flags=re.S | re.M)
+    # any leftover run of 2+ backticks (an inline ```) becomes a code span
+    text = re.sub(r"`{2,}", lambda m: keep("<code>" + m.group(0) + "</code>"), text)
+    # inline code
+    text = re.sub(r"`([^`\n]+)`", lambda m: keep("<code>" + m.group(1) + "</code>"), text)
     # blockquote: one or more consecutive '>' lines (already escaped to &gt;)
     text = re.sub(r"(?m)^(?:[ \t]*&gt;[^\n]*\n?)+", _blockquote, text)
+    # emphasis - placeholders hold no * _ ~ | # so they are never touched
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.S)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.S)
     text = re.sub(r"(?<!\*)\*(?!\*)(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", text)
@@ -692,7 +711,23 @@ def md_to_html(text: str) -> str:
     text = re.sub(r"\|\|(.+?)\|\|", r"<tg-spoiler>\1</tg-spoiler>", text)
     text = re.sub(r"(?m)^[ \t]*#{1,6}[ \t]*(.+?)[ \t]*$", r"<b>\1</b>", text)
     text = re.sub(r"(?m)^[ \t]*[*-][ \t]+", "\u2022 ", text)
+    text = re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m.group(1))], text)
     return text
+
+
+def md_to_plain(text: str) -> str:
+    """Markdown reduced to clean plain text - used if Telegram ever rejects our HTML, so
+    the user never sees raw '**' markers."""
+    t = re.sub(r"```[a-zA-Z0-9_+\-]*\n?(.*?)```", r"\1", text or "", flags=re.S)
+    t = re.sub(r"`([^`\n]+)`", r"\1", t)
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t, flags=re.S)
+    t = re.sub(r"__(.+?)__", r"\1", t, flags=re.S)
+    t = re.sub(r"(?<!\*)\*(?!\*)([^*\n]+?)\*(?!\*)", r"\1", t)
+    t = re.sub(r"~~(.+?)~~", r"\1", t)
+    t = re.sub(r"\|\|(.+?)\|\|", r"\1", t)
+    t = re.sub(r"(?m)^[ \t]*#{1,6}[ \t]*", "", t)
+    t = re.sub(r"(?m)^[ \t]*&gt;[ \t]?", "", t)
+    return t.strip()
 
 
 def strip_md(text: str) -> str:
@@ -1661,9 +1696,13 @@ async def ask_gemini_stream(chat_id, prompt_text: str, context: str,
         return None
     except Exception as e:  # noqa: BLE001
         global _THINKING_OK
-        if "thinking" in str(e).lower():
+        _err = str(e).lower()
+        # Any config/argument rejection is treated as "thinking is not supported here", so
+        # we stop paying for a second failed attempt on every single reply.
+        if "thinking" in _err or "invalid_argument" in _err or "400" in _err:
+            if _THINKING_OK:
+                log.warning("stream: thinking_config rejected - disabling it")
             _THINKING_OK = False
-            log.warning("stream: thinking_config rejected - disabling it")
         if smodel:
             _mark_fail(smodel, str(e))
         log.warning("streaming failed (%s) -> normal path", str(e)[:150])
@@ -2082,11 +2121,12 @@ async def _safe_send(u: Update, c: ContextTypes.DEFAULT_TYPE, html: str, plain: 
             log.warning("HTML reply failed (%s), trying plain/without-reply", e)
             break
     try:
-        await u.message.reply_text(plain, reply_parameters=reply_parameters)
+        # Never show raw '**' if the HTML was rejected - strip the markers instead.
+        await u.message.reply_text(md_to_plain(plain), reply_parameters=reply_parameters)
         return
     except Exception as e:  # noqa: BLE001
         log.warning("Plain reply failed (%s), sending without reply link", e)
-    await _send_plain(c.bot, chat_id, plain)
+    await _send_plain(c.bot, chat_id, md_to_plain(plain))
 
 
 async def _typing_loop(bot, chat_id, stop_evt: asyncio.Event) -> None:
@@ -2241,9 +2281,11 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
         typing_task = asyncio.create_task(_typing_loop(c.bot, chat_id, stop_evt))
         reacted = False
         try:
+            _t0 = time.monotonic()
             image, audio, doc, media_state, transcript = await _prepare_media(c, media)
             if pre_image and not image:            # e.g. a profile picture we fetched
                 image, media_state = (pre_image[0], pre_image[1]), pre_image[2]
+            _t1 = time.monotonic()
             if transcript and not text:
                 text = transcript
             if not text and media:
@@ -2255,6 +2297,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             ctx = await build_context(u, c.bot, lang, media_state, transcript, forward,
                                       want_voice, reply_media)
             prompt = recent_chat_block(chat_id, speaker)
+            _t2 = time.monotonic()
 
             ans = None
             if is_private and client is not None and ENABLE_STREAM:
@@ -2264,6 +2307,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     reacted = True
             if ans is None:
                 ans = await ask_gemini(chat_id, prompt, ctx, image, audio, doc)
+            _t3 = time.monotonic()
 
             rem = _REMEMBER_TAG_RE.search(ans)
             if rem:
@@ -2293,6 +2337,9 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             for chunk in split_text(clean):
                 await _safe_send(u, c, md_to_html(chunk), chunk, rp)
                 rp = None                            # only the first chunk carries the quote
+            log.info("timing[%s] prep=%.2fs ctx=%.2fs ai=%.2fs send=%.2fs TOTAL=%.2fs (stream=%s)",
+                     chat_id, _t1 - _t0, _t2 - _t1, _t3 - _t2, time.monotonic() - _t3,
+                     time.monotonic() - _t0, is_private and ENABLE_STREAM)
 
             if client is not None and want_voice:
                 try:
