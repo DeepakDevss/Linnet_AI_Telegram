@@ -152,8 +152,10 @@ TTS_STYLE = os.environ.get("TTS_STYLE", "").strip() or (
     "and modern - never loud, never breathy or whispery, never robotic, never monotone.")
 
 LOG_LINES = 40                # how many "Name: what" lines to remember per chat
-LOG_LINE_CHARS = 400          # cap each remembered line
-CALL_TIMEOUT = 45
+LOG_LINE_CHARS = 300          # cap each remembered line
+RECENT_CHAT_CHARS = 3500      # TOTAL cap for the transcript sent to the model each turn
+                              # (40 x 400 was up to 16k chars of input on EVERY reply = slow)
+CALL_TIMEOUT = 30             # fail over to the next model faster
 TTS_TIMEOUT = 60
 ENABLE_STREAM = (os.environ.get("ENABLE_STREAM", "true").strip().lower()
                  not in ("0", "false", "no", "off"))
@@ -608,10 +610,20 @@ def log_line(chat_id: int, who: str, text: str) -> None:
 
 
 def recent_chat_block(chat_id: int, speaker: str) -> str:
-    lines = [f"{who}: {txt}" for who, txt in CHAT_LOG.get(chat_id, [])]
+    """Recent 'Name: what they said' lines, capped in TOTAL size. The whole transcript is
+    re-sent to the model on every single reply, so an unbounded one makes replies slow."""
+    items = list(CHAT_LOG.get(chat_id, []))
+    budget, picked = RECENT_CHAT_CHARS, []
+    for who, txt in reversed(items):            # newest first; keep whatever fits
+        line = f"{who}: {txt}"
+        budget -= len(line) + 1
+        if budget < 0 and picked:
+            break
+        picked.append(line)
+    picked.reverse()
     body = ("=== RECENT CHAT (oldest first; format is 'Name: what they said'. "
             "These are different people - do not merge them.) ===\n")
-    body += "\n".join(lines) if lines else "(nothing yet)"
+    body += "\n".join(picked) if picked else "(nothing yet)"
     body += f"\n\nThe last line is the current message from {speaker}. Answer that."
     return body
 
@@ -1054,26 +1066,45 @@ async def wav_to_ogg_opus(wav: bytes):
     return None
 
 
+def _mime_rate(mime: str, default: int = 24000) -> int:
+    """Sample rate from an audio mime type, e.g. 'audio/L16;codec=pcm;rate=24000'."""
+    m = re.search(r"rate=(\d+)", mime or "")
+    try:
+        return int(m.group(1)) if m else default
+    except Exception:  # noqa: BLE001
+        return default
+
+
 async def tts_wav(text: str, lang: str = "english", model=None, voice=None):
-    """Gemini free-tier TTS -> (wav_bytes, model_used). `model`/`voice` lock them so a
-    long reply is spoken by ONE model and ONE voice (no mid-reply voice change)."""
+    """Gemini TTS -> (wav_bytes, model_used). `model`/`voice` are locked so a long reply is
+    spoken by ONE model and ONE voice (no mid-reply change).
+
+    KEY POINT for Gemini 3.8 TTS: the input text is a VERBATIM TRANSCRIPT and delivery
+    directions must go in speech_metadata.style. Writing "Say warmly: hello" into the text
+    means the model either reads the instruction aloud or ignores the style - which is why
+    the voice sounded flat. Older models (2.5 / 3.1) have no speech_metadata, so for those
+    the style still goes in the prompt text (their documented pattern).
+    """
     if client is None:
         return None, None
     spoken = (text or "").strip()[:TTS_MAX_CHARS]
     if not spoken:
         return None, None
-    # Documented safe pattern: a clear preamble + an explicit transcript label, so the
-    # model never reads the instruction aloud.
-    prompt = ("Synthesize natural, human-sounding speech for the transcript below. "
-              f"Delivery style: {TTS_STYLE}. Speak the transcript ONLY - do not read this "
-              f"preamble.\n\nTranscript:\n{spoken}")
     lang_code = LANG_CODE.get(lang, "en-in")
     for m in ([model] if model else TTS_MODELS):
         try:
+            if "3.8" in m or "3.9" in m or m.startswith("gemini-4"):
+                part = types.Part(text=spoken,
+                                  speech_metadata=types.SpeechMetadata(style=TTS_STYLE))
+            else:
+                part = types.Part.from_text(
+                    text=("Synthesize natural, human-sounding speech for the transcript below. "
+                          f"Delivery style: {TTS_STYLE}. Speak the transcript ONLY - do not "
+                          f"read this preamble.\n\nTranscript:\n{spoken}"))
             resp = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=m,
-                    contents=prompt,
+                    contents=[types.Content(role="user", parts=[part])],
                     config=types.GenerateContentConfig(
                         response_modalities=["AUDIO"],
                         speech_config=types.SpeechConfig(
@@ -1085,14 +1116,15 @@ async def tts_wav(text: str, lang: str = "english", model=None, voice=None):
                 ),
                 timeout=TTS_TIMEOUT,
             )
-            part = resp.candidates[0].content.parts[0]
-            data = part.inline_data.data
-            mime = getattr(part.inline_data, "mime_type", "") or ""
+            audio_part = resp.candidates[0].content.parts[0]
+            data = audio_part.inline_data.data
+            mime = getattr(audio_part.inline_data, "mime_type", "") or ""
             if not data:
                 continue
-            if "l16" in mime or "pcm" in mime.lower():
-                return pcm_to_wav(bytes(data), 24000), m
-            return (bytes(data) if data[:4] == b"RIFF" else pcm_to_wav(bytes(data))), m
+            raw = bytes(data)
+            if raw[:4] == b"RIFF":                      # 3.8 returns a complete WAV
+                return raw, m
+            return pcm_to_wav(raw, _mime_rate(mime)), m  # honour the real sample rate
         except Exception as e:  # noqa: BLE001
             log.warning("TTS %s failed: %s", m, str(e)[:120])
             continue
