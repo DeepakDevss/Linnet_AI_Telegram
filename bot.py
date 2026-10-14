@@ -449,8 +449,8 @@ _MODEL_COOLDOWN: dict = {}  # model -> epoch until which it is skipped (just fai
 IMAGE_ENABLED = os.environ.get("IMAGE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 POLLINATIONS_API_KEY = os.environ.get("POLLINATIONS_API_KEY", "").strip()
 # Free text-to-image chain, tried in order (all free-tier on Pollinations).
-IMAGE_MODELS = [m.strip() for m in os.environ.get("IMAGE_MODELS", "").split(",") if m.strip()] \
-    or ["flux", "turbo", "flux-2-dev"]
+IMAGE_MODELS = ([m.strip() for m in os.environ.get("IMAGE_MODELS", "").split(",") if m.strip()]
+                or ["flux", "turbo", "flux-2-dev"])
 IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "1024") or "1024")
 IMAGE_SAFE = os.environ.get("IMAGE_SAFE", "true").strip().lower() in ("1", "true", "yes", "on")
 IMAGE_STYLE = os.environ.get("IMAGE_STYLE", "false").strip().lower() in ("1", "true", "yes", "on")
@@ -2256,6 +2256,12 @@ def _build_app() -> Application:
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN is not set. Add it to the environment.")
+    if not GEMINI_API_KEY:
+        log.warning("GEMINI_API_KEY is not set - the bot cannot answer until you add one "
+                    "(https://aistudio.google.com/app/apikey).")
+    if not GROQ_API_KEY:
+        log.warning("GROQ_API_KEY is not set - no Groq chat fallback, and voice notes cannot be "
+                    "transcribed (https://console.groq.com/keys).")
 
     start_health_server()
     _load_members()

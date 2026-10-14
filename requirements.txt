@@ -6,4 +6,4 @@ tzdata
 # real Telegram VOICE note (OGG/Opus). Without it, the bot still sends the audio
 # as a normal audio file. Remove this line if you want a lighter build.
 imageio-ffmpeg>=0.4.9
-aiolimiter>=1.1
+aiolimiter>=1.2.1
