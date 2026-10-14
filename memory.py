@@ -16,6 +16,7 @@ across deploys, mount a Render Disk (or set MEMORY_FILE to a persistent path).
 """
 
 import json
+import logging
 import os
 import threading
 import time
@@ -70,8 +71,9 @@ def save() -> None:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(_DATA, f, ensure_ascii=False, indent=0)
             os.replace(tmp, MEMORY_FILE)
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        # Never let a memory write crash the bot, but do not swallow it silently either.
+        logging.getLogger("linnet").warning("memory save failed: %s", e)
 
 
 def _touch(obj: dict) -> dict:

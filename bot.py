@@ -64,7 +64,7 @@ from collections import defaultdict, deque
 from zoneinfo import ZoneInfo
 
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                      ReactionTypeEmoji)
+                      ReactionTypeEmoji, ReplyParameters)
 from telegram.constants import ChatAction
 from telegram.error import Conflict, RetryAfter
 from telegram.ext import (
@@ -172,7 +172,7 @@ ALLOWED_REACTIONS = {
 try:
     from telegram.constants import MessageLimit
     TG_TEXT_LIMIT = MessageLimit.MAX_TEXT_LENGTH
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     TG_TEXT_LIMIT = 4096
 
 
@@ -180,7 +180,10 @@ def _resolve_tz():
     name = os.environ.get("TZ_NAME", "Asia/Kolkata")
     try:
         return ZoneInfo(name)
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        # NOTE: the shared `log` object is defined further down, so use a logger here.
+        logging.getLogger("linnet").warning(
+            "Invalid TZ_NAME %r (%s) - falling back to IST", name, e)
         return datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 
@@ -298,6 +301,9 @@ SYSTEM_PROMPT = (
     "[remember: <a short fact>]. It is saved to their profile and removed before they see it. Use "
     "it only for real, lasting facts - never for small talk, and at most one per reply. Use "
     "what you remember naturally, but never read out a person's full private profile.\n"
+    "- QUOTE: if your answer is about ONE specific part of a longer message, you may add a tag "
+    "[quote: <the exact words, copied from their message>] to highlight that part. Copy it "
+    "EXACTLY, character for character - if you are not certain, leave the tag out.\n"
     "\n"
     "=== LAYER 4 — CAPABILITIES (what you can do) ===\n"
     "- Chat naturally in English, Hindi and Hinglish; answer, explain, summarise, translate, write.\n"
@@ -497,9 +503,13 @@ OWNER_NAMES = {n.strip().lower().lstrip("@")
 # ---- Long-term memory (memory.py is optional; the bot still runs without it) ----
 try:
     import memory as MEM
-except Exception as _mem_err:  # noqa: BLE001
+except ImportError as _mem_err:  # memory.py not uploaded
     MEM = None
-    log.warning("memory.py not found (%s) - long-term memory disabled", _mem_err)
+    log.error("memory.py not found (%s) - long-term memory disabled", _mem_err)
+except Exception as _mem_err:  # noqa: BLE001  (e.g. a syntax error inside memory.py)
+    MEM = None
+    log.critical("memory.py failed to import (%s) - fix it; long-term memory is disabled",
+                 _mem_err)
 
 # ---- Speed: Gemini 'thinking' tokens add many seconds of delay. 0 = off (fastest).
 THINKING_BUDGET = int(os.environ.get("THINKING_BUDGET", "0") or "0")
@@ -568,6 +578,10 @@ def _load_members() -> None:
         log.info("Members file loaded (%s chats)", len(MEMBERS))
     except FileNotFoundError:
         pass
+    except json.JSONDecodeError as e:
+        log.error("members.json is corrupted (%s) - starting fresh", e)
+    except PermissionError as e:
+        log.error("members.json cannot be read (%s)", e)
     except Exception as e:  # noqa: BLE001
         log.warning("members.json load failed: %s", e)
 
@@ -662,7 +676,8 @@ def find_reaction(text: str):
 
 
 def clean_reply(text: str) -> str:
-    text = _REMEMBER_TAG_RE.sub("", _IMAGE_TAG_RE.sub("", _ANY_TAG_RE.sub("", text or "")))
+    text = _QUOTE_TAG_RE.sub("", _REMEMBER_TAG_RE.sub(
+        "", _IMAGE_TAG_RE.sub("", _ANY_TAG_RE.sub("", text or ""))))
     head = text.split("\n", 1)[0]
     if head.lstrip().startswith("[") and "]" not in head:
         text = text.split("\n", 1)[1] if "\n" in text else ""
@@ -690,6 +705,42 @@ async def react_with(message, emoji) -> None:
 _URL_RE = re.compile(r"https?://[^\s\)\]\>\"']+")
 _IMG_HINT = re.compile(
     r"\.(?:jpe?g|png|webp|gif|bmp)(?:$|[?#])|images?\.|unsplash|pexels|imgur|photo-\d", re.I)
+
+
+# ============================ PART 9b: TELEGRAM QUOTE (reply to a part) ============================
+def user_quote(msg) -> str:
+    """The exact part of a message the user quoted (Telegram 'Quote'), or ''."""
+    try:
+        q = getattr(msg, "quote", None)
+        return (getattr(q, "text", "") or "").strip() if q is not None else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _quote_reply_parameters(msg, ai_text: str = ""):
+    """Build ReplyParameters so our reply quotes a specific part of the user's message.
+    Telegram only accepts an EXACT substring (max 1024 chars) - anything else makes the
+    send fail - so every candidate is verified against the original text first."""
+    try:
+        if msg is None:
+            return None
+        # 1) A part the AI explicitly chose, if it copied it exactly.
+        mt = _QUOTE_TAG_RE.search(ai_text or "")
+        if mt:
+            cand = mt.group(1).strip()
+            own = (msg.text or msg.caption or "")
+            if cand and len(cand) <= 1024 and cand in own:
+                return ReplyParameters(message_id=msg.message_id, quote=cand)
+        # 2) Otherwise mirror the part the USER quoted.
+        qtext = user_quote(msg)
+        rtm = getattr(msg, "reply_to_message", None)
+        if qtext and rtm is not None and len(qtext) <= 1024:
+            original = rtm.text or rtm.caption or ""
+            if qtext in original:
+                return ReplyParameters(message_id=rtm.message_id, quote=qtext)
+    except Exception as e:  # noqa: BLE001
+        log.debug("quote params failed: %s", e)
+    return None
 
 
 def find_image_urls(text: str) -> list:
@@ -1121,6 +1172,10 @@ async def build_context(u: Update, bot, lang: str, media_state: str = "none",
     else:
         lines.append("This is a private (1-to-1) chat (no group).")
 
+    uq = user_quote(u.effective_message)
+    if uq:
+        lines.append(f'The user specifically QUOTED this part of a message: "{uq[:600]}" - '
+                     f"focus your answer on that part.")
     rtm = getattr(u.effective_message, "reply_to_message", None) if u.effective_message else None
     if rtm is not None:
         who = (rtm.from_user.full_name if rtm.from_user
@@ -1283,6 +1338,7 @@ def _mark_ok(model: str) -> None:
 # so a normal chat message can never accidentally produce an image.
 _IMAGE_TAG_RE = re.compile(r"\[\s*image\s*:\s*([^\]]+)\]", re.I)
 _REMEMBER_TAG_RE = re.compile(r"\[\s*remember\s*:\s*([^\]]+)\]", re.I)
+_QUOTE_TAG_RE = re.compile(r"\[\s*quote\s*:\s*([^\]]+)\]", re.I)
 
 
 # Prompt cleaning + optional style boost (adapted from the Pollinations client you sent).
@@ -1889,12 +1945,14 @@ async def _send_plain(bot, chat_id: int, text: str) -> None:
         log.warning("send failed: %s", e)
 
 
-async def _safe_send(u: Update, c: ContextTypes.DEFAULT_TYPE, html: str, plain: str) -> None:
+async def _safe_send(u: Update, c: ContextTypes.DEFAULT_TYPE, html: str, plain: str,
+                     reply_parameters=None) -> None:
     chat_id = u.effective_chat.id
     await rate_gate(chat_id)
     for _ in range(2):
         try:
-            await u.message.reply_text(html, parse_mode="HTML")
+            await u.message.reply_text(html, parse_mode="HTML",
+                                       reply_parameters=reply_parameters)
             return
         except RetryAfter as e:
             log.info("RetryAfter %ss on reply", e.retry_after)
@@ -1903,7 +1961,7 @@ async def _safe_send(u: Update, c: ContextTypes.DEFAULT_TYPE, html: str, plain: 
             log.warning("HTML reply failed (%s), trying plain/without-reply", e)
             break
     try:
-        await u.message.reply_text(plain)
+        await u.message.reply_text(plain, reply_parameters=reply_parameters)
         return
     except Exception as e:  # noqa: BLE001
         log.warning("Plain reply failed (%s), sending without reply link", e)
@@ -2078,8 +2136,10 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 except Exception as e:
                     log.warning("Image send failed (%s): %s", url[:60], e)
 
+            rp = _quote_reply_parameters(msg, ans)   # quote a part of their message, if any
             for chunk in split_text(clean):
-                await _safe_send(u, c, md_to_html(chunk), chunk)
+                await _safe_send(u, c, md_to_html(chunk), chunk, rp)
+                rp = None                            # only the first chunk carries the quote
 
             if client is not None and want_voice:
                 try:
