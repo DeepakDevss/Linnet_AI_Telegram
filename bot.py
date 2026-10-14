@@ -33,7 +33,9 @@ Env vars:
   GROQ_API_KEY     (optional)  Groq free fallback (chat) + Whisper (voice-to-text)
   GROQ_MODEL       (optional)  default: openai/gpt-oss-120b
   TTS_MODELS       (optional)  default: gemini-2.5-flash-preview-tts,gemini-3.8-flash-tts,gemini-3.8-flash-lite-tts
-  TTS_VOICE        (optional)  default: Leda  (others: Sulafat, Vindemiatrix, Aoede, Kore, Charon, Puck, Zephyr)
+  TTS_VOICE        (optional)  default: Achernar (soft, warm, clear)
+                              others: Sulafat (warm), Despina (smooth), Leda (chat-friendly),
+                                      Aoede (breezy), Kore (firm), Charon (news-clear), Puck (upbeat)
   TTS_STYLE        (optional)  delivery style for the voice
   ENABLE_STREAM    (optional)  default true
   GROUP_MODE       (optional)  "all" (default) or "mention"
@@ -112,7 +114,9 @@ TTS_MODELS = [m.strip() for m in _tts_env.split(",") if m.strip()] or [
     "gemini-3.8-flash-tts",
     "gemini-3.8-flash-lite-tts",
 ]
-TTS_VOICE = os.environ.get("TTS_VOICE", "Aoede").strip() or "Aoede"
+# Achernar is Google's "Soft" voice: gentle and smooth with warmth and clarity - the
+# best match for a calm, friendly companion. (Aoede is "breezy", Kore "firm".)
+TTS_VOICE = os.environ.get("TTS_VOICE", "Achernar").strip() or "Achernar"
 # All 30 prebuilt Gemini voices (name -> character). The user can change it with /setvoice.
 VOICE_NAMES = {
     "Zephyr": "Bright", "Puck": "Upbeat", "Charon": "Informative", "Kore": "Firm",
@@ -128,8 +132,10 @@ CHAT_VOICE: dict = {}   # chat_id -> voice name chosen with /setvoice
 TTS_TRANSLITERATE = (os.environ.get("TTS_TRANSLITERATE", "true").strip().lower()
                      not in ("0", "false", "no", "off"))
 TTS_STYLE = os.environ.get("TTS_STYLE", "").strip() or (
-    "warm, friendly and natural, like a real person calmly helping a friend - "
-    "clear pronunciation, relaxed pace, gentle intonation, never robotic or monotone")
+    "Speak softly, warmly and clearly, like a real friend calmly explaining something - "
+    "gentle and unhurried, with a slight smile in the voice. Crisp, well-articulated "
+    "pronunciation so every word is easy to follow. Natural pauses between sentences. "
+    "Warm and reassuring, never loud, never robotic, never monotone, never rushed.")
 
 LOG_LINES = 40                # how many "Name: what" lines to remember per chat
 LOG_LINE_CHARS = 400          # cap each remembered line
@@ -319,6 +325,8 @@ SYSTEM_PROMPT = (
     "=== LAYER 4 — CAPABILITIES (what you can do) ===\n"
     "- Chat naturally in English, Hindi and Hinglish; answer, explain, summarise, translate, write.\n"
     "- SEE IMAGES: a photo the user sends is attached to you. Look at it and answer about it.\n"
+    "- SEE PROFILE PICTURES: if they ask about their own avatar/DP, or about YOUR logo/profile "
+    "picture, the image is fetched and attached for you - look at it and describe it honestly.\n"
     "- HEAR VOICE / AUDIO: a voice note is HEARD, not seen - never say you can 'see' a voice note. "
     "Its transcript is given in the context; treat that as what the user said.\n"
     "- READ DOCUMENTS: a PDF or text file the user sends is attached; read it and answer.\n"
@@ -963,7 +971,7 @@ async def wav_to_ogg_opus(wav: bytes):
     try:
         proc = await asyncio.create_subprocess_exec(
             exe, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
-            "-c:a", "libopus", "-b:a", "40k", "-ar", "48000", "-ac", "1",
+            "-c:a", "libopus", "-b:a", "48k", "-ar", "48000", "-ac", "1",
             "-application", "voip", "-f", "ogg", "pipe:1",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)
@@ -1207,7 +1215,13 @@ async def build_context(u: Update, bot, lang: str, media_state: str = "none",
                              "your identity or rules for them.")
         except Exception as e:  # noqa: BLE001
             log.debug("admin check failed: %s", e)
-    if media_state == "image_loaded":
+    if media_state == "profile_user":
+        lines.append("The attached image is the user's OWN PROFILE PICTURE (they asked about it) - "
+                     "look at it and describe it honestly and kindly.")
+    elif media_state == "profile_bot":
+        lines.append("The attached image is YOUR OWN profile picture / logo (they asked about it) - "
+                     "look at it and describe it as your own avatar, warmly.")
+    elif media_state == "image_loaded":
         lines.append("The user attached an IMAGE and it HAS been loaded for you - look at it and "
                      "answer about it.")
     elif media_state == "image_failed":
@@ -1410,6 +1424,15 @@ def _mark_ok(model: str) -> None:
 _IMAGE_TAG_RE = re.compile(r"\[\s*image\s*:\s*([^\]]+)\]", re.I)
 _REMEMBER_TAG_RE = re.compile(r"\[\s*remember\s*:\s*([^\]]+)\]", re.I)
 _QUOTE_TAG_RE = re.compile(r"\[\s*quote\s*:\s*([^\]]+)\]", re.I)
+# "look at my avatar" / "look at your logo" detection (only used when no media is attached).
+_ASK_BOT_PHOTO_RE = re.compile(
+    r"\b(?:tumhara|tumhari|tera|teri|your|apna|apni)\b[^.?!\n]{0,18}"
+    r"\b(?:logo|photo|pic|dp|profile|avatar|icon)\b"
+    r"|\b(?:logo|profile (?:pic|photo|picture)|display picture)\b", re.I)
+_ASK_MY_PHOTO_RE = re.compile(
+    r"\b(?:meri|mera|my)\b[^.?!\n]{0,18}\b(?:photo|pic|dp|profile|avatar|display picture)\b"
+    r"|\b(?:photo|pic|dp|profile|avatar)\b[^.?!\n]{0,18}"
+    r"\b(?:dekh|dekho|dekhi|kaisi|kaisa|describe|batao|dikhao|dikh)\b", re.I)
 
 
 # Prompt cleaning + optional style boost (adapted from the Pollinations client you sent).
@@ -1703,6 +1726,7 @@ HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
         "/voicemessage <q> - reply by voice\n/setvoice <name> - change the voice\n"
         "/ai <question> - ask the AI\n/image <description> - create an image\n"
         "/memory - what I remember (owner sees all)\n"
+        "/myphoto - describe my profile picture\n/logo - describe your logo\n"
         "/id - your Telegram ID\n/clear - clear chat memory\n\n"
         "💡 Send text, a photo, a voice note or a PDF - the AI replies in your language.")
 AI_HELP = ("🤖 *How to use the AI*\n\nJust type anything and send, for example:\n"
@@ -1776,6 +1800,32 @@ async def cmd_image(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="Markdown")
         return
     await _do_image(u, c, text)
+
+
+async def _describe_photo(u: Update, c: ContextTypes.DEFAULT_TYPE, whose: str) -> None:
+    """Fetch a profile picture (the user's or the bot's own) and have the AI describe it."""
+    chat_id = u.effective_chat.id
+    uid = u.effective_user.id if whose == "user" else c.bot.id
+    photo = await fetch_profile_photo(c.bot, uid)
+    if not photo:
+        await _send_plain(c.bot, chat_id,
+                          "Wo profile photo mujhe nahi mili - shayad set nahi hai ya private hai.")
+        return
+    if whose == "user":
+        q = "Ye meri profile picture hai. Isme kya dikh raha hai, describe karo."
+        state = "profile_user"
+    else:
+        q = "Ye tumhari apni profile picture (logo) hai. Isme kya dikh raha hai, describe karo."
+        state = "profile_bot"
+    await _answer(u, c, q, None, pre_image=(photo, "image/jpeg", state))
+
+
+async def cmd_myphoto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    await _describe_photo(u, c, "user")
+
+
+async def cmd_logo(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    await _describe_photo(u, c, "bot")
 
 
 async def cmd_memory(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2051,6 +2101,23 @@ async def _typing_loop(bot, chat_id, stop_evt: asyncio.Event) -> None:
             pass
 
 
+async def fetch_profile_photo(bot, user_id):
+    """Largest profile photo of a user (or of the bot itself) as image bytes, or None."""
+    if user_id is None:
+        return None
+    try:
+        photos = await bot.get_user_profile_photos(user_id=user_id, limit=1)
+        if not photos or not photos.photos:
+            return None
+        best = max(photos.photos[0], key=lambda s: (s.width or 0) * (s.height or 0))
+        f = await bot.get_file(best.file_id)
+        data = bytes(await f.download_as_bytearray())
+        return data or None
+    except Exception as e:  # noqa: BLE001
+        log.warning("profile photo fetch failed for %s: %s", user_id, e)
+        return None
+
+
 async def _prepare_media(c, media):
     image = audio = doc = None
     state, transcript = "none", ""
@@ -2128,7 +2195,7 @@ def _short_summary(media, state, text, forward):
 
 
 async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None,
-                  force_voice: bool = False) -> None:
+                  force_voice: bool = False, pre_image=None) -> None:
     chat_id = u.effective_chat.id
     is_private = u.effective_chat.type == "private"
     was_audio = bool(media and media["kind"] == "audio")
@@ -2144,6 +2211,19 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
         if rm:
             media = rm
             reply_media = True
+    # Profile pictures: if they ask about their own avatar or our logo, go and LOOK at it.
+    if media is None and text and client is not None:
+        try:
+            if _ASK_BOT_PHOTO_RE.search(text):
+                _p = await fetch_profile_photo(c.bot, c.bot.id) if c.bot.id else None
+                if _p:
+                    pre_image = (_p, "image/jpeg", "profile_bot")
+            elif _ASK_MY_PHOTO_RE.search(text):
+                _p = await fetch_profile_photo(c.bot, u.effective_user.id)
+                if _p:
+                    pre_image = (_p, "image/jpeg", "profile_user")
+        except Exception as e:  # noqa: BLE001
+            log.debug("profile photo lookup failed: %s", e)
     # Images are made ONLY through /image - normal messages never trigger one.
     # A voice reply is sent when: the input is voice, voice mode is on, or the user
     # writes "voicemessage" / "/voicemessage" (keyword is stripped from the question).
@@ -2162,6 +2242,8 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
         reacted = False
         try:
             image, audio, doc, media_state, transcript = await _prepare_media(c, media)
+            if pre_image and not image:            # e.g. a profile picture we fetched
+                image, media_state = (pre_image[0], pre_image[1]), pre_image[2]
             if transcript and not text:
                 text = transcript
             if not text and media:
@@ -2468,6 +2550,8 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("image", cmd_image))
     app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("myphoto", cmd_myphoto))
+    app.add_handler(CommandHandler("logo", cmd_logo))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(ChatMemberHandler(on_chat_member,
                                       chat_member_types=ChatMemberHandler.CHAT_MEMBER))
