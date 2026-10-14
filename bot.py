@@ -26,22 +26,33 @@ LAYERS
      429 RetryAfter handling, typing refresh, reply-not-found fallback,
      long-message split, error hiding
 
-Env vars:
-  BOT_TOKEN        (required)  BotFather token
-  GEMINI_API_KEY   (required)  Google AI Studio free key
-  GEMINI_MODELS    (optional)  default: gemini-3.5-flash-lite,gemini-3.6-flash
-  GROQ_API_KEY     (optional)  Groq free fallback (chat) + Whisper (voice-to-text)
-  GROQ_MODEL       (optional)  default: openai/gpt-oss-120b
-  TTS_MODELS       (optional)  default: gemini-2.5-flash-preview-tts,gemini-3.8-flash-tts,gemini-3.8-flash-lite-tts
-  TTS_VOICE        (optional)  default: Achernar (soft, warm, clear)
-                              others: Sulafat (warm), Despina (smooth), Leda (chat-friendly),
-                                      Aoede (breezy), Kore (firm), Charon (news-clear), Puck (upbeat)
-  TTS_STYLE        (optional)  delivery style for the voice
-  ENABLE_STREAM    (optional)  default true
-  GROUP_MODE       (optional)  "all" (default) or "mention"
-  TZ_NAME          (optional)  default Asia/Kolkata
-  GROUP_RULES      (optional)  text shown by /rules
-  SYSTEM_PROMPT    (optional)  extra instructions appended to the persona
+Env vars (best practice: leave the *_MODELS ones UNSET and let the built-in chains run):
+  BOT_TOKEN          (required)  BotFather token
+  GEMINI_API_KEY     (required)  Google AI Studio free key
+  GEMINI_MODELS      (optional)  ordered by free daily quota; built-in default:
+                                 gemini-3.5-flash-lite, gemini-3.1-flash-lite, gemma-4-31b-it,
+                                 gemini-3.8-flash, gemini-3.6-flash, gemini-flash-latest
+  GROQ_API_KEY       (optional)  Groq free fallback (chat) + Whisper (voice-to-text)
+  GROQ_MODELS        (optional)  default: openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.6-27b
+  TTS_MODELS         (optional)  default: gemini-3.8-flash-tts, gemini-3.8-flash-lite-tts,
+                                 gemini-2.5-flash-preview-tts
+  TTS_VOICE          (optional)  default: Leda (warm / conversational / youthful)
+                                 others: Kore (firm), Puck (upbeat), Zephyr (bright), Sulafat (warm),
+                                         Despina (smooth), Achernar (soft), Aoede (breezy), Charon (clear)
+  TTS_STYLE          (optional)  delivery style for the voice
+  TTS_TRANSLITERATE  (optional)  default true (Roman Hinglish -> Devanagari before speaking)
+  THINKING_LEVEL     (optional)  default minimal (the biggest speed lever); low/high for more
+  ENABLE_STREAM      (optional)  default true (live streaming in private chats)
+  GROUP_MODE         (optional)  "all" (default) or "mention"
+  TZ_NAME            (optional)  default Asia/Kolkata
+  GROUP_RULES        (optional)  text shown by /rules
+  SYSTEM_PROMPT      (optional)  extra instructions appended to the persona
+  CONCURRENT_UPDATES (optional)  default 16
+  OWNER_IDS          (optional)  your Telegram ID(s) - the bot then knows you are the owner
+  OWNER_NAMES        (optional)  match by name/@username instead (default: Deepak)
+  POLLINATIONS_API_KEY (optional) free image key (removes the watermark)
+  IMAGE_ENABLED/MODELS/SIZE/SAFE/STYLE/COOLDOWN/REFERRER (optional) image defaults
+  MEMORY_FILE / MEMORY_MAX_NOTES / MEMORY_MAX_CHATS (optional) long-term memory
 """
 
 # ============================ PART 1: IMPORTS ============================
@@ -208,7 +219,8 @@ DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
 HINGLISH_HINTS = {
     "hai", "hain", "hoga", "hogi", "kya", "kyu", "kyun", "kaise", "kaisa", "kaisi",
     "nahi", "nahin", "haan", "kitna", "kitne", "chahiye", "bhej", "bhejo", "karo",
-    "karna", "karne", "bhai", "yaar", "thik", "theek", "achha", "acha", "kal", "aaj",
+    "karna", "karne", "bhai", "yaar", "thik",    "theek", "achha", "acha", "kal", "aaj", "ho", "hun", "hu", "raha", "rahe", "kro", "krdo",
+    "dost", "bhaiya", "kaisa", "kaisi", "suno", "dekho", "bolo", "batao", "wala", "wali",
     "abhi", "phir", "paisa", "mera", "meri", "mujhe", "tum", "tumhe", "aap", "aapko",
     "hum", "hume", "bahut", "bohot", "chalo", "jaldi", "samjho", "batao", "bata",
     "apna", "apni", "main", "wo", "ye", "yeh", "de", "le", "kar", "ka", "ki", "ke",
@@ -235,7 +247,12 @@ def detect_language(text: str, chat_id=None) -> str:
     hits = sum(1 for t in tokens if t in HINGLISH_HINTS)
     if hits >= 2:
         return "hinglish"
-    if chat_id is not None and len(tokens) <= 2 and chat_id in CHAT_LANG:
+    # A short message with even ONE Hindi word is Hinglish ("kaise ho", "kal milte").
+    # Previously a single hit scored as English, so the bot answered English to Hinglish.
+    if hits >= 1 and len(tokens) <= 4:
+        return "hinglish"
+    # Stay in the register of the chat for very short follow-ups ("ok", "theek").
+    if chat_id is not None and len(tokens) <= 3 and chat_id in CHAT_LANG:
         return CHAT_LANG[chat_id]
     return "english"
 
@@ -744,6 +761,9 @@ def strip_md(text: str) -> str:
 
 # ============================ PART 7: LONG-MESSAGE SPLIT ============================
 def split_text(text: str, limit: int = None) -> list:
+    """Split a long reply into Telegram-sized chunks. Prefers paragraph / sentence / word
+    boundaries, and never leaves an emphasis or code marker dangling at the end of a chunk
+    (a chunk cut inside '**bold**' used to print raw '**' to the user)."""
     limit = limit or TG_TEXT_LIMIT
     text = text or ""
     if len(text) <= limit:
@@ -753,11 +773,23 @@ def split_text(text: str, limit: int = None) -> list:
         chunk = rest[:limit]
         cut = chunk.rfind("\n")
         if cut < limit // 2:
+            cut = max(chunk.rfind(". "), chunk.rfind("! "), chunk.rfind("? "))
+            if cut >= limit // 2:
+                cut += 1                       # keep the punctuation with its sentence
+        if cut < limit // 2:
             cut = chunk.rfind(" ")
         if cut <= 0:
             cut = limit
-        parts.append(rest[:cut].rstrip())
-        rest = rest[cut:].lstrip("\n ")
+        piece = rest[:cut].rstrip()
+        for mark in ("**", "~~", "||", "`"):
+            if piece.count(mark) % 2:          # marker opened here but not closed
+                j = piece.rfind(mark)
+                if j > limit // 4:
+                    piece = piece[:j].rstrip()
+        if not piece:
+            piece = rest[:limit]
+        parts.append(piece)
+        rest = rest[len(piece):].lstrip("\n ")
     if rest:
         parts.append(rest)
     return parts
@@ -1128,8 +1160,12 @@ async def transliterate_for_tts(text: str, lang: str) -> str:
                   "in Devanagari script. Keep English words as English. Only change the script - "
                   "do NOT translate or change the meaning. Output ONLY the converted text.\n\n"
                   + text[:3000])
+        _order = _model_order()
         resp = await asyncio.wait_for(
-            client.aio.models.generate_content(model=GEMINI_MODELS[0], contents=prompt),
+            client.aio.models.generate_content(
+                model=_order[0] if _order else GEMINI_MODELS[0], contents=prompt,
+                config=_gen_config("You convert text to Devanagari script.",
+                                   _order[0] if _order else "")),
             timeout=CALL_TIMEOUT)
         out = (resp.text or "").strip()
         return out or text
@@ -2088,7 +2124,13 @@ def _should_answer(u: Update, bot) -> bool:
     rtm = msg.reply_to_message
     if rtm and rtm.from_user and getattr(rtm.from_user, "is_bot", False):
         return True
-    if msg.text and re.search(r"/?voice ?message", msg.text, re.I):
+    # mention inside a caption counts too, and the voice trigger matches every variant
+    for e in (msg.caption_entities or []):
+        if e.type == "mention" and msg.caption:
+            frag = msg.caption[e.offset:e.offset + e.length]
+            if me and frag.lower() == f"@{me}":
+                return True
+    if (msg.text or msg.caption) and _voice_requested(msg.text or msg.caption):
         return True
     return False
 
