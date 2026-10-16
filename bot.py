@@ -78,7 +78,8 @@ from collections import defaultdict, deque
 from zoneinfo import ZoneInfo
 
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                      ReactionTypeEmoji, ReplyParameters)
+                      ReactionTypeEmoji, ReplyParameters, BotCommand,
+                      BotCommandScopeChat)
 from telegram.constants import ChatAction
 from telegram.error import Conflict, RetryAfter
 from telegram.ext import (
@@ -1264,10 +1265,12 @@ async def wav_to_ogg_opus(wav: bytes):
         proc = await asyncio.create_subprocess_exec(
             exe, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
             "-c:a", "libopus", "-b:a", "48k", "-ar", "48000", "-ac", "1",
-            "-application", "voip", "-f", "ogg", "pipe:1",
+            "-application", "voip", "-f", "ogg", "pipe:1",   # voice-note friendly
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)
-        out, err = await asyncio.wait_for(proc.communicate(input=wav), timeout=60)
+        # The audio is now one merged note, which can be several minutes long - 60s was
+        # tuned for a single short chunk.
+        out, err = await asyncio.wait_for(proc.communicate(input=wav), timeout=180)
         if proc.returncode == 0 and out:
             return out
         log.warning("ffmpeg convert failed: %s", (err or b"")[:150])
@@ -1424,23 +1427,63 @@ async def transliterate_for_tts(text: str, lang: str) -> str:
         return text
 
 
+def concat_wavs(wavs: list):
+    """Join several WAV blobs into ONE wav -> (bytes, rate). Returns (None, 0) if none usable.
+
+    A small silence is inserted between parts so the join does not sound clipped.
+    """
+    if not wavs:
+        return None, 0
+    rate, frames = 24000, []
+    for b in wavs:
+        try:
+            with wave.open(io.BytesIO(b), "rb") as w:
+                rate = w.getframerate() or rate
+                frames.append(w.readframes(w.getnframes()))
+        except Exception as e:  # noqa: BLE001
+            log.debug("concat: skipping an unreadable part (%s)", e)
+    if not frames:
+        return None, 0
+    if len(frames) == 1:
+        return wavs[0], rate
+    gap = b"\x00\x00" * max(1, int(rate * 0.12))     # ~120ms of silence between parts
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(gap.join(frames))
+    return buf.getvalue(), rate
+
+
 async def send_voice_full(bot, chat_id: int, text: str, lang: str) -> int:
-    """Speak the FULL reply. ONE model + ONE voice are locked for every voice note."""
+    """Speak the FULL reply as ONE voice note.
+
+    The text is still synthesized in SHORT chunks (Google warns that speech consistency
+    drifts on audio longer than a few minutes), but the resulting audio is joined into a
+    single voice note - several separate notes with slightly different delivery was exactly
+    what the user complained about.
+    """
     spoken = tts_clean(text)
     if not spoken:
         return 0
     spoken = await transliterate_for_tts(spoken, lang)
     chunks = merge_short(chunk_for_tts(spoken, TTS_CHUNK))[:TTS_MAX_NOTES]
     voice = _chat_voice(chat_id)
-    model, sent = CHAT_TTS_MODEL.get(chat_id), 0   # sticky model -> same voice as last reply
+    model = CHAT_TTS_MODEL.get(chat_id)            # sticky model -> same voice as last reply
+    wavs = []
     for ch in chunks:
         wav, used = await tts_wav(ch, lang, model=model, voice=voice)
         if wav:
-            model = used or model          # lock the model after the first success
-            CHAT_TTS_MODEL[chat_id] = model  # and remember it for the NEXT reply too
-            if await send_voice_reply(bot, chat_id, wav):
-                sent += 1
-    return sent
+            model = used or model                  # lock the model after the first success
+            CHAT_TTS_MODEL[chat_id] = model        # and remember it for the NEXT reply too
+            wavs.append(wav)
+    if not wavs:
+        return 0
+    merged, _rate = concat_wavs(wavs)
+    if not merged:
+        merged = wavs[0]
+    return 1 if await send_voice_reply(bot, chat_id, merged) else 0
 
 
 async def send_voice_reply(bot, chat_id: int, wav: bytes) -> bool:
@@ -2187,6 +2230,40 @@ HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
         "/myphoto - describe my profile picture\n/logo - describe your logo\n"
         "/id - your Telegram ID\n/clear - clear chat memory\n\n"
         "💡 Send text, a photo, a voice note or a PDF - the AI replies in your language.")
+# Command menus. Telegram's BotFather /setcommands can only publish ONE list for everyone,
+# but the API can also scope a list to a specific chat - so the owner gets the extra
+# owner-only commands in their own private chat. These two lists are the single source of
+# truth; the text below is what you paste into BotFather.
+PUBLIC_COMMANDS = [
+    ("start", "Start the bot"),
+    ("help", "Show every command"),
+    ("about", "About Linnet"),
+    ("info", "Your info and this chat"),
+    ("rules", "Show the group rules"),
+    ("setup", "Post and pin the rules (admin)"),
+    ("welcome", "Re-post the welcome card (admin)"),
+    ("stats", "Group information"),
+    ("members", "Members I have seen"),
+    ("voice", "Turn voice replies on or off"),
+    ("voicemessage", "Ask something and get a voice reply"),
+    ("setvoice", "Change my voice"),
+    ("voicepreview", "Hear a voice before setting it"),
+    ("ai", "Ask the AI"),
+    ("image", "Create an image"),
+    ("memory", "What I remember about you"),
+    ("proactive", "Let me send useful ideas on my own"),
+    ("myphoto", "Describe my profile picture"),
+    ("logo", "Describe your logo"),
+    ("id", "Your Telegram ID"),
+    ("clear", "Clear this chat's memory"),
+]
+OWNER_COMMANDS = [
+    ("diag", "Diagnostics + live self-test"),
+    ("voicecreate", "Design a custom voice"),
+    ("voicelist", "Your custom voices"),
+    ("voicefind", "Search 2000+ voices"),
+]
+
 AI_HELP = ("🤖 *How to use the AI*\n\nJust type anything and send, for example:\n"
            "• _What is today's date?_\n• _How many members are in this group?_\n"
            "• _What did Ashish ask earlier?_\n• _Write a short poem_\n\n"
@@ -2894,7 +2971,17 @@ async def send_welcome(bot, chat_id: int, user) -> None:
 
 
 async def cmd_welcome(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_welcome(c.bot, u.effective_chat.id, u.effective_user)
+    """Re-post the welcome card. Admin-only in groups - otherwise anyone could spam it."""
+    chat = u.effective_chat
+    if chat.type != "private":
+        try:
+            if not (is_owner(u.effective_user)
+                    or await _is_admin(c.bot, chat, u.effective_user.id)):
+                await _send_plain(c.bot, chat.id, "That command is for group admins.")
+                return
+        except Exception as e:  # noqa: BLE001
+            log.debug("welcome admin check failed: %s", e)
+    await send_welcome(c.bot, chat.id, u.effective_user)
 
 
 async def on_chat_member(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3075,6 +3162,32 @@ async def _post_init(app) -> None:
         log.warning("delete_webhook failed (ignored): %s", e)
     app.create_task(_cleanup_loop())
     app.create_task(_proactive_loop(app.bot))          # no-op unless opted in
+    await _setup_commands(app)
+
+
+async def _setup_commands(app) -> None:
+    """Publish the command menu: the public list for everyone, plus the owner-only commands
+    scoped to the owner's own private chat.
+
+    BotFather's /setcommands can only set ONE list for the whole bot; per-role menus need
+    setMyCommands with a scope, which is what this does.
+    """
+    public = [BotCommand(c, d) for c, d in PUBLIC_COMMANDS]
+    try:
+        await app.bot.set_my_commands(public)
+        log.info("command menu set (%s public commands)", len(public))
+    except Exception as e:  # noqa: BLE001
+        log.warning("set_my_commands failed: %s", e)
+    if not OWNER_IDS:
+        return
+    owner_list = public + [BotCommand(c, d) for c, d in OWNER_COMMANDS]
+    for oid in OWNER_IDS:
+        try:
+            await app.bot.set_my_commands(owner_list,
+                                          scope=BotCommandScopeChat(chat_id=oid))
+            log.info("owner command menu set for %s", oid)
+        except Exception as e:  # noqa: BLE001
+            log.warning("owner command scope failed for %s: %s", oid, e)
 
 
 async def _post_shutdown(app) -> None:
