@@ -343,7 +343,35 @@ def stats() -> dict:
 def forget(user_id) -> bool:
     load()
     with _LOCK:
-        return _DATA["users"].pop(str(user_id), None) is not None
+        gone = _DATA["users"].pop(str(user_id), None) is not None
+    if gone:
+        save(force=True)
+    return gone
+
+
+def purge_old(days: int) -> dict:
+    """Delete users/chats not seen in `days` days. Returns {'users': n, 'chats': n}.
+
+    This is what makes the retention promise in privacy-policy.md true; days <= 0 disables it.
+    """
+    if not days or days <= 0:
+        return {"users": 0, "chats": 0}
+    load()
+    cutoff = int(time.time()) - days * 86400
+    with _LOCK:
+        du = [k for k, v in _DATA["users"].items()
+              if int(v.get("last_seen", 0) or 0) < cutoff]
+        dc = [k for k, v in _DATA["chats"].items()
+              if int(v.get("last_seen", 0) or 0) < cutoff]
+        for k in du:
+            _DATA["users"].pop(k, None)
+        for k in dc:
+            _DATA["chats"].pop(k, None)
+    if du or dc:
+        save(force=True)
+        _log.info("retention purge: removed %s users, %s chats older than %s days",
+                  len(du), len(dc), days)
+    return {"users": len(du), "chats": len(dc)}
 
 
 def export() -> dict:
