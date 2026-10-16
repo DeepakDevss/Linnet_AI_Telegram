@@ -184,6 +184,22 @@ MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "1600") or "1600")
 # Total seconds allowed for ONE walk over the Gemini model chain (0 = uncapped). Each model
 # is tried with and without thinking, so without this the walk could run for minutes.
 GEMINI_BUDGET = float(os.environ.get("GEMINI_BUDGET", "25") or "25")
+
+# ---- PROACTIVE INTELLIGENCE (OFF by default - a chat must opt in with /proactive on) ----
+# When on, the bot may occasionally send a short, genuinely useful idea/reminder about what
+# it remembers for that chat, without waiting to be prompted. Deliberately limited:
+#   * capped per day, never more,
+#   * quiet hours respected (no late-night pings),
+#   * one message (/proactive off) turns it off for good,
+#   * NO guilt, streaks, fake urgency or 'you haven't talked in a while' - that is banned.
+PROACTIVE_ENABLED = os.environ.get("PROACTIVE_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on")
+PROACTIVE_INTERVAL = float(os.environ.get("PROACTIVE_INTERVAL", "21600") or "21600")  # 6 hours
+PROACTIVE_MAX_PER_DAY = int(os.environ.get("PROACTIVE_MAX_PER_DAY", "1") or "1")
+PROACTIVE_MAX_CHARS = int(os.environ.get("PROACTIVE_MAX_CHARS", "420") or "420")
+PROACTIVE_QUIET = os.environ.get("PROACTIVE_QUIET_HOURS", "22-8").strip()   # local hours
+PROACTIVE_SEARCH = os.environ.get("PROACTIVE_SEARCH", "true").strip().lower() not in (
+    "0", "false", "no", "off")
 MAX_IMAGE_BYTES = 18 * 1024 * 1024
 MAX_AUDIO_BYTES = 20 * 1024 * 1024
 MAX_DOC_BYTES = 18 * 1024 * 1024
@@ -2009,6 +2025,7 @@ HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
         "/voicemessage <q> - reply by voice\n/setvoice <name> - change the voice\n"
         "/ai <question> - ask the AI\n/image <description> - create an image\n"
         "/memory - what I remember (owner sees all)\n"
+        "/proactive on|off - let me send useful ideas on my own\n"
         "/myphoto - describe my profile picture\n/logo - describe your logo\n"
         "/id - your Telegram ID\n/clear - clear chat memory\n\n"
         "💡 Send text, a photo, a voice note or a PDF - the AI replies in your language.")
@@ -2751,6 +2768,116 @@ async def _cleanup_loop() -> None:
             log.warning("cleanup failed: %s", e)
 
 
+# ============================ PART 15: PROACTIVE INTELLIGENCE ============================
+# The bot can offer something useful WITHOUT being prompted - but only for chats that opted
+# in, at most PROACTIVE_MAX_PER_DAY times, never during quiet hours, and never with guilt,
+# streaks or fake urgency. One '/proactive off' stops it for good.
+_PROACTIVE_SENT: dict = {}          # chat_id -> (day_key, count_today)
+_FREE_SEARCH_URL = "https://html.duckduckgo.com/html/"
+
+
+async def free_web_search(query: str, n: int = 4) -> str:
+    """Best-effort keyless web search (DuckDuckGo HTML endpoint) -> short text, or ''.
+
+    The Gemini free tier has NO search grounding, so this is the only way to get anything
+    current. It is unfriendly to datacenter IPs, so every failure is silent and callers
+    simply carry on without it.
+    """
+    if not query:
+        return ""
+    try:
+        r = await HTTP.post(_FREE_SEARCH_URL, data={"q": query},
+                            headers={"User-Agent": "Mozilla/5.0 (compatible; Linnet/1.0)"})
+        if r.status_code != 200:
+            return ""
+        out = []
+        for m in re.finditer(
+                r'result__a"[^>]*>(.*?)</a>.*?result__snippet"[^>]*>(.*?)</a>',
+                r.text or "", re.S | re.I):
+            title = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+            snip = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            if title:
+                out.append(f"- {title}: {snip[:200]}")
+            if len(out) >= n:
+                break
+        return "\n".join(out)
+    except Exception as e:  # noqa: BLE001
+        log.debug("free search failed: %s", e)
+        return ""
+
+
+def _in_quiet_hours(now) -> bool:
+    """True during PROACTIVE_QUIET, e.g. '22-8' = 10pm through 8am local time."""
+    try:
+        a, b = (int(x) for x in PROACTIVE_QUIET.split("-", 1))
+    except Exception:  # noqa: BLE001
+        return False
+    h = now.hour
+    return (a <= h or h < b) if a > b else (a <= h < b)
+
+
+async def _send_proactive(bot, chat_id: int) -> None:
+    """Compose and send ONE short, useful proactive note for this chat."""
+    cs = MEM.chat_summary(chat_id) or ""
+    topic = ""
+    for who, txt in reversed(CHAT_LOG.get(chat_id, [])):
+        if who != "Linnet" and len(txt) > 12:
+            topic = txt
+            break
+    if not topic and not cs:
+        return                                   # nothing to go on - stay quiet
+    fresh = await free_web_search(topic[:120], 3) if (PROACTIVE_SEARCH and topic) else ""
+    lang = CHAT_LANG.get(chat_id, "english")
+    ask = (
+        "Write ONE short proactive message (max 2 sentences) for this chat, without being "
+        "asked. It must be genuinely useful: a concrete idea, a next step, or a tip about "
+        "what they were doing. Do not greet. "
+        f"Reply in {LANG_LABEL.get(lang, 'Hinglish')}, same script as usual here. "
+        "STRICT: no 'I missed you', no guilt, no streaks, no fake urgency, no emoji spam. "
+        "End by mentioning in one short clause that /proactive off stops these.\n\n"
+        f"Chat memory: {cs}\nTheir last topic: {topic[:400]}\n"
+        + (f"Fresh web results (may be empty; ignore if irrelevant):\n{fresh}\n" if fresh else "")
+    )
+    ans = await ask_gemini(chat_id, ask,
+                           "=== LIVE CONTEXT ===\nThis is a proactive message; keep it very short.")
+    if not ans or ans == BUSY_MSG:
+        return
+    clean = clean_reply(ans)[:PROACTIVE_MAX_CHARS].strip()
+    if not clean:
+        return
+    for chunk in split_text(clean):
+        await _send_plain(bot, chat_id, md_to_plain(chunk))
+    log.info("proactive sent to %s", chat_id)
+
+
+async def _proactive_loop(bot) -> None:
+    """Offer each opted-in chat ONE idea every PROACTIVE_INTERVAL. Capped, quiet-hours aware."""
+    if not PROACTIVE_ENABLED or MEM is None:
+        log.info("proactive: off (needs PROACTIVE_ENABLED=true and /proactive on)")
+        return
+    await asyncio.sleep(120)                     # let startup settle
+    while True:
+        try:
+            now = now_local()
+            if not _in_quiet_hours(now):
+                day = now.strftime("%Y-%m-%d")
+                for chat_id in MEM.chats_with_flag("proactive", True):
+                    day_key, count = _PROACTIVE_SENT.get(chat_id, (day, 0))
+                    if day_key != day:
+                        day_key, count = day, 0
+                    if count >= PROACTIVE_MAX_PER_DAY:
+                        continue
+                    try:
+                        await _send_proactive(bot, chat_id)
+                        _PROACTIVE_SENT[chat_id] = (day_key, count + 1)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("proactive to %s failed: %s", chat_id, str(e)[:120])
+                    await asyncio.sleep(5)       # never burst
+        except Exception as e:  # noqa: BLE001
+            log.warning("proactive loop error: %s", str(e)[:150])
+        await asyncio.sleep(PROACTIVE_INTERVAL)
+
+
 async def _post_init(app) -> None:
     # Clear any stale webhook so long polling never conflicts with one.
     try:
@@ -2759,6 +2886,7 @@ async def _post_init(app) -> None:
     except Exception as e:  # noqa: BLE001
         log.warning("delete_webhook failed (ignored): %s", e)
     app.create_task(_cleanup_loop())
+    app.create_task(_proactive_loop(app.bot))          # no-op unless opted in
 
 
 async def _post_shutdown(app) -> None:
@@ -2767,6 +2895,35 @@ async def _post_shutdown(app) -> None:
         await HTTP_STT.aclose()
     except Exception:  # noqa: BLE001
         pass
+
+
+async def cmd_proactive(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Opt in/out of proactive suggestions. Off by default, and one word turns it off."""
+    if MEM is None:
+        await u.message.reply_text("Memory is off, so proactive mode is unavailable.")
+        return
+    chat_id = u.effective_chat.id
+    arg = (c.args[0].lower() if c.args else "status")
+    if arg in ("on", "start", "yes"):
+        if not PROACTIVE_ENABLED:
+            await u.message.reply_text(
+                "Proactive mode is disabled on the server. Set PROACTIVE_ENABLED=true in the "
+                "Render environment, then run /proactive on.")
+            return
+        MEM.set_chat_flag(chat_id, "proactive", True)
+        await u.message.reply_text(
+            "On. I may send one short, useful idea at most once a day - never at night, and "
+            "never with guilt or streaks. Send /proactive off to stop it.")
+    elif arg in ("off", "stop", "no"):
+        MEM.set_chat_flag(chat_id, "proactive", False)
+        await u.message.reply_text("Off. I will not message you on my own again.")
+    else:
+        on = bool(MEM.get_chat(chat_id).get("proactive"))
+        await u.message.reply_text(
+            f"Proactive: {'ON' if on else 'OFF'}\n"
+            f"Server setting: {'enabled' if PROACTIVE_ENABLED else 'disabled'}\n"
+            f"Max {PROACTIVE_MAX_PER_DAY}/day, quiet hours {PROACTIVE_QUIET}.\n"
+            "Use /proactive on or /proactive off.")
 
 
 # ============================ PART 17: DIAGNOSTIC ============================
@@ -2891,6 +3048,7 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("image", cmd_image))
     app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("proactive", cmd_proactive))
     app.add_handler(CommandHandler("myphoto", cmd_myphoto))
     app.add_handler(CommandHandler("logo", cmd_logo))
     app.add_handler(CallbackQueryHandler(on_button))

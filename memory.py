@@ -238,18 +238,43 @@ def remember_chat(chat, lang=None, chat_type=None) -> None:
     if not cid:
         return
     load()
-    with _LOCK:
-        c = _DATA["chats"].setdefault(cid, {})
-    _touch(c)
-    c["type"] = chat_type or getattr(chat, "type", None) or c.get("type") or "?"
-    title = getattr(chat, "title", None)
-    if title:
-        c["title"] = title
-    if getattr(chat, "username", None):
-        c["username"] = chat.username
-    if lang:
-        c["language"] = lang
+    with _LOCK:                                  # all mutation inside the lock (same fix as
+        c = _DATA["chats"].setdefault(cid, {})   # remember_user - no lost updates)
+        _touch(c)
+        c["type"] = chat_type or getattr(chat, "type", None) or c.get("type") or "?"
+        title = getattr(chat, "title", None)
+        if title:
+            c["title"] = title
+        if getattr(chat, "username", None):
+            c["username"] = chat.username
+        if lang:
+            c["language"] = lang
     save()
+
+
+def set_chat_flag(chat_id, key: str, value) -> None:
+    """Store a small per-chat setting (e.g. proactive opt-in). Persists across restarts."""
+    if chat_id is None:
+        return
+    load()
+    with _LOCK:
+        c = _DATA["chats"].setdefault(str(chat_id), {})
+        _touch(c)
+        c[key] = value
+    save()
+
+
+def get_chat(chat_id) -> dict:
+    load()
+    return _DATA["chats"].get(str(chat_id), {}) or {}
+
+
+def chats_with_flag(key: str, value=True) -> list:
+    """Every chat id where `key == value` (used by the proactive loop)."""
+    load()
+    with _LOCK:
+        return [int(k) for k, c in _DATA["chats"].items()
+                if c.get(key) == value and k.lstrip("-").isdigit()]
 
 
 def chat_summary(chat_id) -> str:
@@ -272,6 +297,13 @@ def chat_summary(chat_id) -> str:
 def get_user(user_id) -> dict:
     load()
     return _DATA["users"].get(str(user_id), {}) or {}
+
+
+def all_notes(user_id) -> list:
+    """The stored facts about a user (used to personalise proactive messages)."""
+    load()
+    u = _DATA["users"].get(str(user_id)) or {}
+    return list(u.get("likes") or [])
 
 
 def stats() -> dict:
