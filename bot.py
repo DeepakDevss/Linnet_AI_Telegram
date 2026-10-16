@@ -158,21 +158,48 @@ TTS_TRANSLITERATE = (os.environ.get("TTS_TRANSLITERATE", "true").strip().lower()
 # paragraphs / "Director's Notes" are "the most common cause of voice drift", and "extra
 # prompt text increases drift". Most requests need no style at all; one short constant
 # string reused for every chunk is what keeps a single, stable voice.
-TTS_STYLE = os.environ.get("TTS_STYLE", "").strip() or "warm, friendly, casual"
+# The four traits the owner asked for, packed into ONE short constant string:
+#   Josh (enthusiasm) -> cheerful      Humdardee (empathy) -> warm, soft
+#   Spashtta (clarity) -> clear        Asliyat (authenticity) -> natural, like a close friend
+# Kept SHORT on purpose - Google's own guidance is that long or varied style text is the main
+# cause of voice drift, and a single constant string is what holds one voice steady.
+TTS_STYLE = (os.environ.get("TTS_STYLE", "").strip()
+             or "warm, cheerful, soft, clear and natural - like a close friend talking")
 # Hindi/Hinglish gets its own short direction so Devanagari does not read like translated text.
-TTS_STYLE_HI = os.environ.get("TTS_STYLE_HI", "").strip() or "warm, friendly, natural Hindi"
-# Per-voice tweaks for the two the owner picked. Still ONE short constant string per voice -
-# Google's guide warns that long or varied style text is what makes the voice drift.
+TTS_STYLE_HI = (os.environ.get("TTS_STYLE_HI", "").strip()
+                or "warm, cheerful, soft, clear and natural Hindi - like a close friend")
+# Per-voice tweaks. Still ONE short constant string per voice (see note above).
 VOICE_STYLE = {
-    "Leda": "warm, friendly, casual",
-    "Sulafat": "warm, gentle, reassuring",
+    "Leda": "warm, cheerful, soft and clear - like a close friend",
+    "Sulafat": "warm, gentle, soothing and clear",
+    "Zephyr": "bright, cheerful, soft and clear",
+    "Autonoe": "bright, warm, cheerful and clear",
+    "Vindemiatrix": "gentle, soft, warm and clear",
+    "Aoede": "breezy, warm, friendly and clear",
     "Kore": "warm, clear, confident",
-    "Aoede": "warm, breezy, friendly",
-    "Achird": "warm, friendly, upbeat",
+    "Achernar": "soft, warm and clear",
 }
-# The voices the owner liked - shown first everywhere.
-TOP_VOICES = ("Sulafat", "Leda", "Kore", "Aoede", "Achird", "Despina")
-
+# FEMALE voices only, ordered soft/youthful first - the owner wants a soft, anime-girl-like
+# voice, and half the 30 prebuilt voices are male (Achird is male, for example).
+TOP_VOICES = ("Leda", "Zephyr", "Sulafat", "Autonoe", "Vindemiatrix", "Aoede")
+# Prebuilt voices that are female (from Google's own gender column) - used to keep the
+# shortlists honest.
+FEMALE_VOICES = {
+    "Achernar", "Aoede", "Autonoe", "Callirrhoe", "Despina", "Erinome", "Gacrux",
+    "Kore", "Laomedeia", "Leda", "Pulcherrima", "Sulafat", "Vindemiatrix", "Zephyr",
+}
+# Ready-made Voice-design descriptions. The user can just type /voicecreate anime.
+VOICE_PRESETS = {
+    "anime": "A soft, sweet young woman's voice with a bright, youthful anime-heroine "
+             "quality - light and airy, gentle and warm, clear articulation, natural "
+             "conversational pacing, a real smile in the tone, never shrill.",
+    "soft": "A soft, gentle young woman's voice - calm, warm and soothing, with clear "
+            "articulation and an unhurried, comforting pace.",
+    "warm": "A warm, friendly young woman's voice - bright and cheerful with a real smile "
+            "in the tone, clear and natural, like talking to a close friend.",
+    "friend": "A natural, easy-going young woman's voice - relaxed and conversational, "
+              "warm and clear, with the small imperfections of real speech.",
+}
 LOG_LINES = int(os.environ.get("LOG_LINES", "40") or "40")          # lines kept per chat
 LOG_LINE_CHARS = int(os.environ.get("LOG_LINE_CHARS", "300") or "300")   # cap per line
 RECENT_CHAT_CHARS = int(os.environ.get("RECENT_CHAT_CHARS", "3500") or "3500")
@@ -709,6 +736,24 @@ IMAGE_SAFE = os.environ.get("IMAGE_SAFE", "true").strip().lower() in ("1", "true
 IMAGE_STYLE = os.environ.get("IMAGE_STYLE", "false").strip().lower() in ("1", "true", "yes", "on")
 IMAGE_COOLDOWN = int(os.environ.get("IMAGE_COOLDOWN", "15") or "15")
 IMAGE_REFERRER = os.environ.get("IMAGE_REFERRER", "linnet-ai").strip() or "linnet-ai"
+# Optional style / shape words right after /image:
+#   /image anime a girl in a garden   |   /image photo a cup of chai   |   /image tall a poster
+IMAGE_PRESETS = {
+    "anime": "anime style, cel shaded, clean line art, vibrant colours, soft lighting, "
+             "detailed expressive eyes, high quality",
+    "cute": "cute chibi anime style, soft pastel colours, kawaii, gentle warm lighting, "
+            "adorable, high quality",
+    "photo": "photorealistic photograph, natural lighting, shallow depth of field, sharp "
+             "focus, realistic textures, 50mm lens",
+    "real": "photorealistic photograph, natural lighting, realistic detail",
+    "art": "digital painting, rich colours, dramatic lighting, detailed brushwork, "
+           "artstation quality",
+    "sketch": "pencil sketch, fine line work, detailed shading, hand-drawn",
+    "3d": "3d render, soft studio lighting, subsurface scattering, highly detailed",
+    "logo": "minimal flat vector logo, clean lines, simple shapes, solid background",
+}
+IMAGE_RATIOS = {"square": (1, 1), "tall": (2, 3), "portrait": (2, 3),
+                "wide": (16, 9), "landscape": (16, 9)}
 # Tertiary, no-key text fallback (used only when Gemini AND Groq both fail).
 POLLINATIONS_TEXT_URL = "https://text.pollinations.ai/openai"
 POLLINATIONS_TEXT_MODEL = os.environ.get("POLLINATIONS_TEXT_MODEL", "openai").strip() or "openai"
@@ -1768,18 +1813,45 @@ def _clean_prompt(prompt: str) -> str:
     return " ".join(kept) or p
 
 
-async def generate_image(prompt: str):
+def parse_image_args(args: list):
+    """Pull an optional style preset and aspect ratio off the front of /image args.
+    Returns (style_text, (w, h) or None, remaining_prompt)."""
+    style, ratio, rest = "", None, [a for a in (args or []) if a]
+    for _ in range(2):                       # at most one preset + one ratio word
+        if not rest:
+            break
+        w = rest[0].lower()
+        if not style and w in IMAGE_PRESETS:
+            style = IMAGE_PRESETS[w]
+            rest.pop(0)
+        elif ratio is None and w in IMAGE_RATIOS:
+            ratio = IMAGE_RATIOS[w]
+            rest.pop(0)
+        else:
+            break
+    return style, ratio, " ".join(rest).strip()
+
+
+async def generate_image(prompt: str, style: str = "", ratio=None):
     """Return image bytes from Pollinations (free tier). Tries each free model in turn,
     with a short backoff on rate-limit (402/429) and server errors."""
     if not IMAGE_ENABLED or not prompt:
         return None
     clean = _clean_prompt(prompt)
-    if IMAGE_STYLE and _IMG_STYLE_BOOSTERS.lower() not in clean.lower():
+    if style:
+        clean = f"{clean}, {style}"          # the caller's preset wins
+    elif IMAGE_STYLE and _IMG_STYLE_BOOSTERS.lower() not in clean.lower():
         clean = f"{clean}, {_IMG_STYLE_BOOSTERS}"
     enc = urllib.parse.quote(clean[:500], safe="")
     headers = {"Authorization": f"Bearer {POLLINATIONS_API_KEY}"} if POLLINATIONS_API_KEY else {}
+    # Scale the ratio so the LONGER side is IMAGE_SIZE (otherwise both sides clamp to 2048
+    # and a 'wide' request comes back square).
+    rw, rh = ratio if ratio else (1, 1)
+    scale = IMAGE_SIZE / max(rw, rh)
+    width = max(256, min(2048, int(rw * scale)))
+    height = max(256, min(2048, int(rh * scale)))
     for model in IMAGE_MODELS:
-        params = {"model": model, "width": IMAGE_SIZE, "height": IMAGE_SIZE,
+        params = {"model": model, "width": width, "height": height,
                   "seed": random.randint(1, 2_147_483_647), "private": "true",
                   "referrer": IMAGE_REFERRER}
         if POLLINATIONS_API_KEY:
@@ -1806,7 +1878,8 @@ async def generate_image(prompt: str):
     return None
 
 
-async def send_generated_image(bot, chat_id: int, prompt: str) -> bool:
+async def send_generated_image(bot, chat_id: int, prompt: str,
+                               style: str = "", ratio=None) -> bool:
     if not IMAGE_ENABLED or not prompt:
         return False
     now = time.time()
@@ -1817,7 +1890,7 @@ async def send_generated_image(bot, chat_id: int, prompt: str) -> bool:
         await bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
     except Exception:  # noqa: BLE001
         pass
-    data = await generate_image(prompt)
+    data = await generate_image(prompt, style, ratio)
     if not data:
         return False
     await rate_gate(chat_id)
@@ -2083,7 +2156,8 @@ HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
         "/memory - what I remember (owner sees all)\n"
         "/proactive on|off - let me send useful ideas on my own\n"
         "/voicepreview <name> - hear a voice before setting it\n"
-        "/voicecreate <desc> - design a custom voice (owner)\n"
+        "/voicecreate <desc|anime> - design a custom voice (owner)\n"
+        "/voicefind <word> - search 2000+ voices\n"
         "/myphoto - describe my profile picture\n/logo - describe your logo\n"
         "/id - your Telegram ID\n/clear - clear chat memory\n\n"
         "💡 Send text, a photo, a voice note or a PDF - the AI replies in your language.")
@@ -2131,7 +2205,8 @@ async def cmd_voicemessage(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await _answer(u, c, text, None, force_voice=True)
 
 
-async def _do_image(u: Update, c: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
+async def _do_image(u: Update, c: ContextTypes.DEFAULT_TYPE, prompt: str,
+                    style: str = "", ratio=None) -> None:
     chat_id = u.effective_chat.id
     prompt = (prompt or "").strip()
     if not prompt:
@@ -2141,7 +2216,7 @@ async def _do_image(u: Update, c: ContextTypes.DEFAULT_TYPE, prompt: str) -> Non
         await _send_plain(c.bot, chat_id, "🎨 One image at a time - try again in a few seconds.")
         return
     await _send_plain(c.bot, chat_id, f"🎨 Creating: {prompt[:200]}")
-    if not await send_generated_image(c.bot, chat_id, prompt):
+    if not await send_generated_image(c.bot, chat_id, prompt, style, ratio):
         await _send_plain(c.bot, chat_id,
                           "😕 Couldn't create that image right now. Please try again.")
 
@@ -2150,14 +2225,18 @@ async def cmd_image(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     if not IMAGE_ENABLED:
         await u.message.reply_text("Image creation is switched off.")
         return
-    text = " ".join(c.args) if c.args else ""
+    # Optional leading words pick a style and/or shape: /image anime tall a girl in a garden
+    style, ratio, text = parse_image_args(list(c.args or []))
     if not text:
         await u.message.reply_text(
-            "🎨 *Create an image*\n\nUsage: `/image <description>`\n"
-            "Example: `/image a golden retriever puppy on a beach at sunset`",
+            "🎨 *Create an image*\n\nUsage: `/image [style] [shape] <description>`\n\n"
+            f"Styles: {', '.join(IMAGE_PRESETS)}\n"
+            f"Shapes: {', '.join(IMAGE_RATIOS)}\n\n"
+            "Examples:\n`/image anime a girl reading under a tree`\n"
+            "`/image photo wide a chai cup on a wooden table`",
             parse_mode="Markdown")
         return
-    await _do_image(u, c, text)
+    await _do_image(u, c, text, style, ratio)
 
 
 async def _describe_photo(u: Update, c: ContextTypes.DEFAULT_TYPE, whose: str) -> None:
@@ -2999,22 +3078,31 @@ async def cmd_voicecreate(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(u.effective_user):
         await u.message.reply_text("That command is owner-only.")
         return
-    desc = " ".join(c.args).strip() if c.args else ""
-    if not desc:
+    arg = " ".join(c.args).strip() if c.args else ""
+    if not arg:
         await u.message.reply_text(
             "Usage: /voicecreate <description>\n\n"
-            "Example:\n/voicecreate a warm, bright young woman's voice - friendly, clear and "
-            "natural, with a soft smile in the tone and easy conversational pacing")
+            "Ready presets:\n  /voicecreate " + "\n  /voicecreate ".join(VOICE_PRESETS) +
+            "\n\nOr describe it yourself, e.g.:\n"
+            "/voicecreate a soft, sweet young woman's voice, bright and youthful, clear and "
+            "warm with a smile in the tone")
         return
+    # A preset name is a one-word shortcut for a tuned description.
+    desc = VOICE_PRESETS.get(arg.lower(), arg)
     await u.message.reply_text("🎨 Designing the voice... this can take 10-20s.")
     try:
         v = await asyncio.wait_for(
             client.aio.voices.create(
-                voice={"type": "prompted",
-                       "prompted": {"input": desc},
-                       "display_name": "Linnet custom",
-                       "description": desc[:200]},
-                store=True),
+                store=True,
+                voice={
+                    "model": TTS_MODELS[0],
+                    "type": "prompted",
+                    "display_name": f"Linnet {arg[:24]}",
+                    "gender": "female",
+                    "language_code": "hi-IN",
+                    "description": desc[:200],
+                    "prompted": {"input": desc},
+                }),
             timeout=90)
     except Exception as e:  # noqa: BLE001
         log.warning("voice create failed: %s", str(e)[:200])
@@ -3029,7 +3117,7 @@ async def cmd_voicecreate(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     _set_chat_voice(u.effective_chat.id, str(vid))
     await u.message.reply_text(
         f"✅ Custom voice created and set for this chat.\nID: {vid}\n"
-        "Send /voicepreview to hear it, or /setvoice Sulafat to go back.")
+        "Hear it with /voicepreview. To go back: /setvoice Leda")
     # Prefer Google's own preview audio; fall back to synthesizing a short line.
     wav = None
     sa = getattr(v, "sample_audio", None)
@@ -3044,6 +3132,38 @@ async def cmd_voicecreate(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         wav, _ = await tts_wav("नमस्ते! मैं Linnet हूँ। ये मेरी नई आवाज़ है।", "hindi", voice=str(vid))
     if wav:
         await send_voice_reply(c.bot, u.effective_chat.id, wav)
+
+
+async def cmd_voicefind(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search the 2,000+ voice Extended Voice Library (e.g. /voicefind anime, /voicefind soft)."""
+    if client is None:
+        await u.message.reply_text("Voice needs a Gemini key, which is not set.")
+        return
+    q = " ".join(c.args).strip() if c.args else ""
+    if not q:
+        await u.message.reply_text(
+            "Usage: /voicefind <word>\nTry: /voicefind anime, /voicefind soft, "
+            "/voicefind sweet, /voicefind young female, /voicefind gentle")
+        return
+    try:
+        r = await asyncio.wait_for(client.aio.voices.list(search=q, page_size=25), timeout=30)
+    except Exception as e:  # noqa: BLE001
+        await u.message.reply_text("Voice search failed: " + str(e)[:250])
+        return
+    found = []
+    for v in (getattr(r, "voices", None) or []):
+        vid = getattr(v, "id", None) or getattr(v, "name", None)
+        if not vid:
+            continue
+        nm = getattr(v, "display_name", None) or str(vid)
+        g = getattr(v, "gender", None) or "?"
+        found.append(f"{nm} ({g})\n   {vid}")
+    if not found:
+        await u.message.reply_text(f"Nothing matched '{q}'. Try another word.")
+        return
+    await u.message.reply_text(
+        f"🔎 '{q}' - {len(found)} match(es):\n\n" + "\n".join(found)[:3400] +
+        "\n\nHear one with /voicepreview <id>, then /setvoice <id>.")
 
 
 async def cmd_voicelist(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3222,6 +3342,7 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("voicepreview", cmd_voicepreview))
     app.add_handler(CommandHandler("voicecreate", cmd_voicecreate))
     app.add_handler(CommandHandler("voicelist", cmd_voicelist))
+    app.add_handler(CommandHandler("voicefind", cmd_voicefind))
     app.add_handler(CommandHandler("myphoto", cmd_myphoto))
     app.add_handler(CommandHandler("logo", cmd_logo))
     app.add_handler(CallbackQueryHandler(on_button))
