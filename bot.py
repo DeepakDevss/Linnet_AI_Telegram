@@ -125,10 +125,12 @@ if "gemini-flash-latest" not in GEMINI_MODELS:
 # Voice Design benchmark) - the OLD 2.5-flash-preview-tts was first here, which is exactly
 # why the voice sounded dated. Newest/best first, older only as a fallback.
 _tts_env = os.environ.get("TTS_MODELS", "").strip()
+# Only the two 3.8 models. gemini-2.5-flash-preview-tts was removed: it is the dated voice
+# the user heard as "old/mid", and it has a DIFFERENT timbre for the same voice name - so a
+# fallback to it changed the voice mid-conversation.
 TTS_MODELS = [m.strip() for m in _tts_env.split(",") if m.strip()] or [
     "gemini-3.8-flash-tts",
     "gemini-3.8-flash-lite-tts",
-    "gemini-2.5-flash-preview-tts",
 ]
 # Leda is "warm, conversational" and the voice reviewers pick for chat agents/companions.
 # ('Soft' voices like Achernar are gentle but can sound quiet and dated over a chat.)
@@ -145,20 +147,19 @@ VOICE_NAMES = {
     "Sadachbia": "Lively", "Sadaltager": "Knowledgeable", "Sulafat": "Warm",
 }
 CHAT_VOICE: dict = {}   # chat_id -> voice name chosen with /setvoice
+# chat_id -> the TTS model that actually worked. Sticky, so every reply is spoken by the SAME
+# model: switching between 3.8-flash-tts and 3.8-flash-lite-tts changes the timbre even with
+# the same voice name - that is a big part of "the voice sometimes changes".
+CHAT_TTS_MODEL: dict = {}
 TTS_TRANSLITERATE = (os.environ.get("TTS_TRANSLITERATE", "true").strip().lower()
                      not in ("0", "false", "no", "off"))
-TTS_STYLE = os.environ.get("TTS_STYLE", "").strip() or (
-    "Speak like a warm, upbeat young friend talking naturally - clear, confident and easy to "
-    "follow, with a real smile in the voice. Natural conversational pacing with small pauses "
-    "at commas and full stops, light natural intonation (not flat, not sing-song). Friendly "
-    "and modern - never loud, never breathy or whispery, never robotic, never monotone.")
-# Hindi/Hinglish needs its OWN delivery direction: an English-tuned style gives Devanagari a
-# slightly off, translated-sounding read. This keeps it native and unhurried.
-TTS_STYLE_HI = os.environ.get("TTS_STYLE_HI", "").strip() or (
-    "Speak like a warm, friendly Hindi speaker from North India talking to a friend - natural "
-    "Hindi intonation and rhythm, soft consonants, natural pauses at commas and full stops. "
-    "Clear and easy to follow, with a real smile in the voice. Not formal, not a news-reader, "
-    "never robotic, never breathy, never flat.")
+# SHORT style strings ON PURPOSE. Google's own TTS guidance is explicit: long style
+# paragraphs / "Director's Notes" are "the most common cause of voice drift", and "extra
+# prompt text increases drift". Most requests need no style at all; one short constant
+# string reused for every chunk is what keeps a single, stable voice.
+TTS_STYLE = os.environ.get("TTS_STYLE", "").strip() or "warm, friendly, casual"
+# Hindi/Hinglish gets its own short direction so Devanagari does not read like translated text.
+TTS_STYLE_HI = os.environ.get("TTS_STYLE_HI", "").strip() or "warm, friendly, natural Hindi"
 
 LOG_LINES = int(os.environ.get("LOG_LINES", "40") or "40")          # lines kept per chat
 LOG_LINE_CHARS = int(os.environ.get("LOG_LINE_CHARS", "300") or "300")   # cap per line
@@ -192,7 +193,9 @@ GEMINI_BUDGET = float(os.environ.get("GEMINI_BUDGET", "25") or "25")
 #   * quiet hours respected (no late-night pings),
 #   * one message (/proactive off) turns it off for good,
 #   * NO guilt, streaks, fake urgency or 'you haven't talked in a while' - that is banned.
-PROACTIVE_ENABLED = os.environ.get("PROACTIVE_ENABLED", "false").strip().lower() in (
+# Default ON so '/proactive on' just works; the real gate is the per-chat opt-in, and a
+# chat that never opts in is never messaged. Set PROACTIVE_ENABLED=false for a hard off.
+PROACTIVE_ENABLED = os.environ.get("PROACTIVE_ENABLED", "true").strip().lower() in (
     "1", "true", "yes", "on")
 PROACTIVE_INTERVAL = float(os.environ.get("PROACTIVE_INTERVAL", "21600") or "21600")  # 6 hours
 PROACTIVE_MAX_PER_DAY = int(os.environ.get("PROACTIVE_MAX_PER_DAY", "1") or "1")
@@ -204,9 +207,12 @@ MAX_IMAGE_BYTES = 18 * 1024 * 1024
 MAX_AUDIO_BYTES = 20 * 1024 * 1024
 MAX_DOC_BYTES = 18 * 1024 * 1024
 TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "3000") or "3000")   # per-request safety cap
-TTS_CHUNK = int(os.environ.get("TTS_CHUNK", "2500") or "2500")           # chars per voice note
-TTS_MAX_NOTES = int(os.environ.get("TTS_MAX_NOTES", "5") or "5")         # max voice notes per reply
-TTS_MIN_TAIL = 220                                                        # merge tails shorter than this
+# Smaller chunks on purpose: Google warns that speech "quality and consistency might drift
+# for audio longer than a few minutes". 2500 chars was ~3 minutes of audio in ONE request -
+# inside the drift zone. ~900 chars is well under a minute, so the voice holds.
+TTS_CHUNK = int(os.environ.get("TTS_CHUNK", "900") or "900")             # chars per voice note
+TTS_MAX_NOTES = int(os.environ.get("TTS_MAX_NOTES", "8") or "8")         # max voice notes per reply
+TTS_MIN_TAIL = 140                                                        # merge tails shorter than this
 BUSY_MSG = ("🌸 Linnet is a little busy right now. "
             "Please try again in a minute or two.")
 
@@ -1193,7 +1199,10 @@ async def tts_wav(text: str, lang: str = "english", model=None, voice=None):
     if not spoken:
         return None, None
     lang_code = LANG_CODE.get(lang, "en-in")
-    for m in ([model] if model else TTS_MODELS):
+    # A locked model is tried FIRST (same voice every time), but never exclusively - if it
+    # fails we still fall back down the chain rather than sending no voice at all.
+    order = ([model] + [x for x in TTS_MODELS if x != model]) if model else list(TTS_MODELS)
+    for m in order:
         try:
             style = TTS_STYLE_HI if lang in ("hindi", "hinglish") else TTS_STYLE
             if "3.8" in m or "3.9" in m or m.startswith("gemini-4"):
@@ -1317,11 +1326,12 @@ async def send_voice_full(bot, chat_id: int, text: str, lang: str) -> int:
     spoken = await transliterate_for_tts(spoken, lang)
     chunks = merge_short(chunk_for_tts(spoken, TTS_CHUNK))[:TTS_MAX_NOTES]
     voice = CHAT_VOICE.get(chat_id) or TTS_VOICE
-    model, sent = None, 0
+    model, sent = CHAT_TTS_MODEL.get(chat_id), 0   # sticky model -> same voice as last reply
     for ch in chunks:
         wav, used = await tts_wav(ch, lang, model=model, voice=voice)
         if wav:
             model = used or model          # lock the model after the first success
+            CHAT_TTS_MODEL[chat_id] = model  # and remember it for the NEXT reply too
             if await send_voice_reply(bot, chat_id, wav):
                 sent += 1
     return sent
@@ -2026,6 +2036,7 @@ HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
         "/ai <question> - ask the AI\n/image <description> - create an image\n"
         "/memory - what I remember (owner sees all)\n"
         "/proactive on|off - let me send useful ideas on my own\n"
+        "/voicepreview <name> - hear a voice before setting it\n"
         "/myphoto - describe my profile picture\n/logo - describe your logo\n"
         "/id - your Telegram ID\n/clear - clear chat memory\n\n"
         "💡 Send text, a photo, a voice note or a PDF - the AI replies in your language.")
@@ -2176,7 +2187,8 @@ async def cmd_setvoice(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         cur = CHAT_VOICE.get(cid) or TTS_VOICE
         top = "Aoede, Sulafat, Achird, Leda, Vindemiatrix, Achernar, Kore, Charon"
         await u.message.reply_text(
-            f"🎙 Current voice: *{cur}*.\nChange with `/setvoice <name>`.\n\n"
+            f"🎙 Current voice: *{cur}*.\nChange with `/setvoice <name>`.\n"
+            f"Hear one first with `/voicepreview <name>`.\n\n"
             f"Good picks: {top}\n\nAll: " + ", ".join(VOICE_NAMES),
             parse_mode="Markdown")
         return
@@ -2897,6 +2909,29 @@ async def _post_shutdown(app) -> None:
         pass
 
 
+async def cmd_voicepreview(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hear a short sample of any of the 30 voices before choosing one with /setvoice."""
+    if client is None:
+        await u.message.reply_text("Voice needs a Gemini key, which is not set.")
+        return
+    chat_id = u.effective_chat.id
+    name = (c.args[0].strip().capitalize() if c.args else
+            (CHAT_VOICE.get(chat_id) or TTS_VOICE))
+    if name not in VOICE_NAMES:
+        lines = ["Usage: /voicepreview <name>", "", "Voices (name - character):"]
+        lines += [f"  {v} - {ch}" for v, ch in VOICE_NAMES.items()]
+        await u.message.reply_text("\n".join(lines)[:3800])
+        return
+    await u.message.reply_text(f"🔊 {name} - {VOICE_NAMES[name]}")
+    # A short Devanagari sample: it shows the voice on Hindi, which is what most chat here is.
+    sample = "नमस्ते! मैं Linnet हूँ। आप कैसे हैं? मैं आपकी मदद के लिए यहाँ हूँ।"
+    wav, _ = await tts_wav(sample, "hindi", voice=name)
+    if not wav:
+        await u.message.reply_text("Could not generate that sample - try again in a moment.")
+        return
+    await send_voice_reply(c.bot, chat_id, wav)
+
+
 async def cmd_proactive(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     """Opt in/out of proactive suggestions. Off by default, and one word turns it off."""
     if MEM is None:
@@ -3049,6 +3084,7 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("image", cmd_image))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("proactive", cmd_proactive))
+    app.add_handler(CommandHandler("voicepreview", cmd_voicepreview))
     app.add_handler(CommandHandler("myphoto", cmd_myphoto))
     app.add_handler(CommandHandler("logo", cmd_logo))
     app.add_handler(CallbackQueryHandler(on_button))
