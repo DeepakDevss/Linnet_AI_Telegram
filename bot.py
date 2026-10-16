@@ -113,6 +113,9 @@ _models_env = os.environ.get("GEMINI_MODELS", "").strip()
 # Ordered by FREE DAILY QUOTA, best first. Flash-Lite models get ~500 requests/day on
 # the free tier, while the plain Flash models (3.5/3.6/3.7/3.8) get only ~20/day - so
 # they are kept only as a last resort, otherwise they run out almost immediately.
+# True when the chain came from the environment. A stale GEMINI_MODELS overrides the tuned
+# default (and often points at retired ids), so we say so loudly at startup and in /diag.
+GEMINI_MODELS_FROM_ENV = bool(_models_env)
 GEMINI_MODELS = [m.strip() for m in _models_env.split(",") if m.strip()] or [
     "gemini-3.5-flash-lite",   # ~500 RPD
     "gemini-3.1-flash-lite",   # ~500 RPD
@@ -732,6 +735,9 @@ _RATE_LIMITER_ON = False   # set True when PTB's AIORateLimiter is active
 _MODEL_RR = 0              # start position in the chain
 _MODEL_COOLDOWN: dict = {}  # model -> epoch until which it is skipped (just failed)
 _LAST_GOOD = None          # the model that last answered - always tried first
+# Model ids that returned 404 (they do not exist for this key - e.g. the gemini-2.5-* ids
+# for a new project). Remembered so we never waste an attempt on them again.
+_DEAD_MODELS: set = set()
 
 # ---- Image generation (Pollinations - free; key optional) ----
 IMAGE_ENABLED = os.environ.get("IMAGE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
@@ -1808,6 +1814,9 @@ def _model_order() -> list:
     else:
         start = _MODEL_RR % n
     order = [GEMINI_MODELS[(start + i) % n] for i in range(n)]
+    order = [m for m in order if m not in _DEAD_MODELS]     # never retry a 404'd model
+    if not order:
+        order = [m for m in GEMINI_MODELS]                  # all dead? try anyway
     now = time.time()
     return ([m for m in order if _MODEL_COOLDOWN.get(m, 0) <= now]
             + [m for m in order if _MODEL_COOLDOWN.get(m, 0) > now])
@@ -1993,6 +2002,7 @@ async def _gemini_pass(contents, sys_instr, budget: float = 0.0):
     global _THINKING_OK
     last = ""
     quota_hits = 0
+    _retried_503 = False          # only one 503-retry per walk, so it cannot stall us
     deadline = (time.monotonic() + budget) if budget else 0.0
     for model in _model_order():
         if deadline and time.monotonic() > deadline:
@@ -2033,11 +2043,26 @@ async def _gemini_pass(contents, sys_instr, budget: float = 0.0):
                 log.warning("%s (think=%s) failed: %s", model, thinking, last[:150])
                 quota = "429" in last or "RESOURCE_EXHAUSTED" in last
                 timed_out = isinstance(e, asyncio.TimeoutError)
-                if (thinking and not quota and not timed_out and "404" not in last
-                        and "not found" not in last.lower()):
+                # 503 UNAVAILABLE = the model is briefly overloaded, NOT broken. A short wait
+                # and one retry on the SAME model usually succeeds, and it beats walking the
+                # whole chain (which ends in a 'busy' reply when every model is 503ing).
+                overloaded = ("503" in last or "UNAVAILABLE" in last
+                              or "overloaded" in last.lower())
+                if overloaded and not _retried_503:
+                    _retried_503 = True
+                    log.info("%s is overloaded (503) - retrying it once after a short wait", model)
+                    await asyncio.sleep(1.2)
+                    continue
+                if (thinking and not quota and not timed_out and not overloaded
+                        and "404" not in last and "not found" not in last.lower()):
                     _THINKING_OK = False   # retry the SAME model without thinking
                     continue
                 _mark_fail(model, last)
+                # A 404 means this model id does not exist for this project - remember it so we
+                # stop wasting an attempt on it every single reply.
+                if "404" in last or "not found" in last.lower():
+                    _DEAD_MODELS.add(model)
+                    log.warning("%s does not exist for this key - skipping it from now on", model)
                 if quota:
                     # Gemini quota is shared per PROJECT, so once two models say 429 the
                     # rest will too - stop hammering and let Groq/Pollinations answer.
@@ -3437,7 +3462,9 @@ async def cmd_proactive(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
 # ============================ PART 17: DIAGNOSTIC ============================
 async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [f"🔑 Gemini key: {bool(GEMINI_API_KEY)}",
-             f"Models: {', '.join(GEMINI_MODELS)}",
+             f"Models: {', '.join(GEMINI_MODELS)}"
+             + ("  ⚠️ from GEMINI_MODELS env - DELETE that variable to use the tuned default"
+                if GEMINI_MODELS_FROM_ENV else "  (tuned default)"),
              f"🔑 Groq: {bool(GROQ_API_KEY)} (chat fallback + Whisper)",
              f"🖼 Vision: {'on' if client is not None else 'off (no Gemini key)'}",
              f"🔊 TTS: {'on' if client is not None else 'off'} "
@@ -3464,14 +3491,32 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
                              else f"⚠️ {model}: empty reply")
             except Exception as e:  # noqa: BLE001
                 lines.append(f"❌ {model}: {str(e)[:90]}")
+    if not GROQ_API_KEY:
+        lines.append("⚠️ Groq: no GROQ_API_KEY set (no chat fallback!)")
+    elif not GROQ_API_KEY.startswith("gsk_"):
+        lines.append("⚠️ Groq: the key does not start with 'gsk_' - that is almost certainly "
+                     "wrong. Copy the full key from console.groq.com/keys")
     if GROQ_API_KEY:
-        try:
-            g = await ask_groq("You are a test.", [{"role": "user", "content": "ping"}])
-            lines.append(f"✅ Groq: OK ({g[:20]})" if g else "⚠️ Groq: empty reply")
-        except Exception as e:  # noqa: BLE001
-            lines.append(f"❌ Groq: {str(e)[:90]}")
-    else:
-        lines.append("⚠️ Groq: no GROQ_API_KEY set")
+        # Test each Groq model on its own, so a 401 (bad key) is not hidden behind a 429.
+        _gh = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        _badkey = False
+        for gm in GROQ_MODELS:
+            try:
+                r = await HTTP.post(GROQ_URL, headers=_gh,
+                                    json={"model": gm, "max_tokens": 5,
+                                          "messages": [{"role": "user", "content": "ping"}]})
+                if r.status_code == 200:
+                    lines.append(f"✅ Groq {gm}: OK")
+                elif r.status_code in (401, 403):
+                    _badkey = True
+                    lines.append(f"❌ Groq {gm}: {r.status_code} - KEY REJECTED")
+                else:
+                    lines.append(f"❌ Groq {gm}: HTTP {r.status_code} {r.text[:60]}")
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"❌ Groq {gm}: {str(e)[:70]}")
+        if _badkey:
+            lines.append("👉 The Groq key is being REJECTED (401). Make a fresh key at "
+                         "console.groq.com/keys and paste it with no spaces.")
     try:
         p = await ask_pollinations("You are a test.", [{"role": "user", "content": "ping"}])
         lines.append(f"✅ Pollinations: OK ({p[:20]})" if p else "⚠️ Pollinations: empty reply")
@@ -3586,6 +3631,10 @@ def main() -> None:
     if not GEMINI_API_KEY:
         log.warning("GEMINI_API_KEY is not set - the bot cannot answer until you add one "
                     "(https://aistudio.google.com/app/apikey).")
+    if GEMINI_MODELS_FROM_ENV:
+        log.warning("GEMINI_MODELS is set in the environment, so the tuned model chain is being "
+                    "OVERRIDDEN (it may point at retired ids). Delete GEMINI_MODELS to use the "
+                    "built-in list. Current: %s", ", ".join(GEMINI_MODELS))
     if not GROQ_API_KEY:
         log.warning("GROQ_API_KEY is not set - no Groq chat fallback, and voice notes cannot be "
                     "transcribed (https://console.groq.com/keys).")
