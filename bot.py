@@ -762,8 +762,23 @@ HTTP_IMG = httpx.AsyncClient(timeout=150)
 
 # ---- Owner / admin ----
 OWNER_IDS = {int(x) for x in re.findall(r"\d+", os.environ.get("OWNER_IDS", ""))}
+# SECURITY: name matching is OFF unless the owner explicitly sets OWNER_NAMES.
+# Telegram profile names are USER-CONTROLLED, so the old default of "Deepak" meant anyone
+# could rename themselves Deepak and get owner access - which includes /memory (the whole
+# user database) and /voicecreate. IDs cannot be spoofed, so they are the real check.
+_owner_names_env = os.environ.get("OWNER_NAMES", "").strip()
 OWNER_NAMES = {n.strip().lower().lstrip("@")
-               for n in os.environ.get("OWNER_NAMES", "Deepak").split(",") if n.strip()}
+               for n in _owner_names_env.split(",") if n.strip()}
+NAME_OWNER_MATCH = bool(OWNER_NAMES)
+# ---- Abuse guards ----
+# One AI reply per user at a time. The chat lock already serialised replies, but nothing
+# stopped someone pasting 100 messages and queueing 100 sequential model calls - which
+# drains the free daily quota and starves everyone else. A second message while a reply is
+# still in flight is simply skipped.
+USER_BUSY: set = set()
+# Optional per-user daily cap on AI answers (0 = no cap). A backstop against slow spam.
+USER_DAILY_CAP = int(os.environ.get("USER_DAILY_CAP", "0") or "0")
+_USER_DAY: dict = {}          # user_id -> (day_key, count)
 
 # ---- Long-term memory (memory.py is optional; the bot still runs without it) ----
 try:
@@ -1683,11 +1698,17 @@ def _gen_config(sys_instr: str, model: str = "", thinking: bool = True):
 
 
 def is_owner(user) -> bool:
-    """True if this user is the bot's owner (matched by ID, or by name/username)."""
+    """True only for the real owner. ID match is authoritative and cannot be spoofed.
+
+    Name/username matching runs ONLY when the owner deliberately set OWNER_NAMES, because
+    anyone can change their Telegram display name to any string.
+    """
     if user is None:
         return False
     if getattr(user, "id", None) in OWNER_IDS:
         return True
+    if not NAME_OWNER_MATCH:
+        return False
     fn = (getattr(user, "first_name", "") or "").strip().lower()
     un = (getattr(user, "username", "") or "").strip().lower().lstrip("@")
     full = (getattr(user, "full_name", "") or "").strip().lower()
@@ -1699,10 +1720,15 @@ _CHAT_ADMINS: dict = {}
 
 
 async def _is_admin(bot, chat, user_id) -> bool:
-    """Is this user an admin of the group? (cached for 10 minutes)"""
+    """Is this user an admin of the group? (cached for 2 minutes)
+
+    The cache was 10 minutes, so a user promoted, used, then immediately demoted kept their
+    'admin' status in the bot's eyes for up to 10 minutes. 2 minutes is a safer middle ground
+    between accuracy and Telegram API calls.
+    """
     now = time.time()
     c = _CHAT_ADMINS.get(chat.id)
-    if not c or now - c[1] > 600:
+    if not c or now - c[1] > 120:
         try:
             admins = await bot.get_chat_administrators(chat.id)
             ids = {a.user.id for a in admins}
@@ -2496,7 +2522,28 @@ async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             log.debug("memory write failed: %s", e)
     if not _should_answer(u, c.bot):
         return
-    await _answer(u, c, text, media)
+    # Abuse guards (see USER_BUSY / USER_DAILY_CAP above).
+    uid = getattr(u.effective_user, "id", 0) or 0
+    if uid and uid in USER_BUSY:
+        log.info("user %s already has a reply in flight - skipping this one", uid)
+        return
+    if USER_DAILY_CAP:
+        day = now_local().strftime("%Y-%m-%d")
+        d, n = _USER_DAY.get(uid, (day, 0))
+        if d != day:
+            d, n = day, 0
+        if n >= USER_DAILY_CAP:
+            _USER_DAY[uid] = (d, n)
+            await _send_plain(c.bot, u.effective_chat.id,
+                              "Aaj ke liye bahut messages ho gaye. Kal phir baat karte hain.")
+            return
+        _USER_DAY[uid] = (d, n + 1)
+    if uid:
+        USER_BUSY.add(uid)
+    try:
+        await _answer(u, c, text, media)
+    finally:
+        USER_BUSY.discard(uid)
 
 
 async def _send_plain(bot, chat_id: int, text: str) -> None:
@@ -3031,6 +3078,12 @@ async def _post_init(app) -> None:
 
 
 async def _post_shutdown(app) -> None:
+    # Flush any batched memory write so the last few updates are not lost on shutdown.
+    if MEM is not None:
+        try:
+            MEM.flush()
+        except Exception as e:  # noqa: BLE001
+            log.warning("memory flush on shutdown failed: %s", e)
     try:
         await HTTP.aclose()
         await HTTP_STT.aclose()
@@ -3228,6 +3281,11 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
              f"🧠 Memory: {LOG_LINES} lines/chat",
              f"🎬 Streaming: {ENABLE_STREAM}",
              f"👥 Group mode: {GROUP_MODE}",
+             f"👑 Owner IDs: {len(OWNER_IDS)} set"
+             + (f" | name match ON ({len(OWNER_NAMES)})" if NAME_OWNER_MATCH else ""),
+             "🛡 Abuse guard: 1 reply/user at a time"
+             + (f", daily cap {USER_DAILY_CAP}" if USER_DAILY_CAP else ", no daily cap"),
+             f"💾 Memory file: {getattr(MEM, 'MEMORY_FILE', 'n/a')}",
              "--- live self-test (Gemini is primary, Groq secondary) ---"]
     if client is None:
         lines.append("❌ Gemini client not created (GEMINI_API_KEY missing).")
@@ -3365,6 +3423,24 @@ def main() -> None:
     if not GROQ_API_KEY:
         log.warning("GROQ_API_KEY is not set - no Groq chat fallback, and voice notes cannot be "
                     "transcribed (https://console.groq.com/keys).")
+    if not OWNER_IDS:
+        log.warning("OWNER_IDS is not set - nobody is recognised as the owner, so owner-only "
+                    "commands (/memory, /voicecreate, /voicelist, /voicefind) will not work. "
+                    "Send /id to the bot and put that number in OWNER_IDS.")
+    if NAME_OWNER_MATCH:
+        log.warning("OWNER_NAMES is set, so owner access also matches by NAME. Telegram profile "
+                    "names are user-controlled - anyone who renames themselves to one of those "
+                    "names gets owner access. Prefer OWNER_IDS.")
+    if MEM is not None:
+        try:
+            log.info("memory file: %s", MEM.MEMORY_FILE)
+            if os.environ.get("RENDER") or "render" in os.environ.get("RENDER_SERVICE_ID", ""):
+                if not os.environ.get("MEMORY_FILE"):
+                    log.warning("Running on Render WITHOUT MEMORY_FILE set: the disk is wiped on "
+                                "every redeploy, so all long-term memory will be lost. Mount a "
+                                "Render Disk and set MEMORY_FILE to a path on it.")
+        except Exception as e:  # noqa: BLE001
+            log.debug("memory path check failed: %s", e)
 
     start_health_server()
     _load_members()

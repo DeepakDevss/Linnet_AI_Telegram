@@ -70,17 +70,46 @@ def load() -> None:
         _log.error("memory load failed (%s) - starting fresh: %s", MEMORY_FILE, e)
 
 
-def save() -> None:
-    """Write the memory file atomically."""
+_DIRTY = False
+_LAST_SAVE = 0.0
+# A synchronous json.dump + os.replace on EVERY message blocks the asyncio event loop (the
+# file only grows), so writes are batched: at most one disk write per SAVE_DEBOUNCE seconds.
+SAVE_DEBOUNCE = float(os.environ.get("MEMORY_SAVE_DEBOUNCE", "5") or "5")
+
+
+def save(force: bool = False) -> None:
+    """Mark the store dirty; the actual write happens at most once per SAVE_DEBOUNCE seconds.
+
+    Pass force=True (e.g. on shutdown) to write immediately.
+    """
+    global _DIRTY
+    _DIRTY = True
+    if not force and SAVE_DEBOUNCE > 0 and (time.time() - _LAST_SAVE) < SAVE_DEBOUNCE:
+        return
+    _flush()
+
+
+def _flush() -> None:
+    """Write the memory file atomically (only if something changed)."""
+    global _DIRTY, _LAST_SAVE
     try:
         with _LOCK:
+            if not _DIRTY:
+                return
             tmp = MEMORY_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(_DATA, f, ensure_ascii=False, indent=0)
             os.replace(tmp, MEMORY_FILE)
+            _DIRTY = False
+            _LAST_SAVE = time.time()
     except Exception as e:  # noqa: BLE001
         # Never let a memory write crash the bot, but do not swallow it silently either.
         logging.getLogger("linnet").warning("memory save failed: %s", e)
+
+
+def flush() -> None:
+    """Force an immediate write - call on shutdown so nothing is lost."""
+    save(force=True)
 
 
 def _touch(obj: dict) -> dict:
