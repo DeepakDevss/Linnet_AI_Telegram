@@ -58,6 +58,7 @@ Env vars (best practice: leave the *_MODELS ones UNSET and let the built-in chai
 # ============================ PART 1: IMPORTS ============================
 import os
 import io
+import base64
 import re
 import urllib.parse
 import unicodedata
@@ -160,6 +161,17 @@ TTS_TRANSLITERATE = (os.environ.get("TTS_TRANSLITERATE", "true").strip().lower()
 TTS_STYLE = os.environ.get("TTS_STYLE", "").strip() or "warm, friendly, casual"
 # Hindi/Hinglish gets its own short direction so Devanagari does not read like translated text.
 TTS_STYLE_HI = os.environ.get("TTS_STYLE_HI", "").strip() or "warm, friendly, natural Hindi"
+# Per-voice tweaks for the two the owner picked. Still ONE short constant string per voice -
+# Google's guide warns that long or varied style text is what makes the voice drift.
+VOICE_STYLE = {
+    "Leda": "warm, friendly, casual",
+    "Sulafat": "warm, gentle, reassuring",
+    "Kore": "warm, clear, confident",
+    "Aoede": "warm, breezy, friendly",
+    "Achird": "warm, friendly, upbeat",
+}
+# The voices the owner liked - shown first everywhere.
+TOP_VOICES = ("Sulafat", "Leda", "Kore", "Aoede", "Achird", "Despina")
 
 LOG_LINES = int(os.environ.get("LOG_LINES", "40") or "40")          # lines kept per chat
 LOG_LINE_CHARS = int(os.environ.get("LOG_LINE_CHARS", "300") or "300")   # cap per line
@@ -315,6 +327,36 @@ _VOICE_PHRASE_RE = re.compile(
     r"|\baudio\s*(?:me|m)\b",
     re.I)
 _VOICE_SOLO_RE = re.compile(r"^[\W_]*(?:voice|awaaz|voicemessage)[\W_]*$", re.I)
+
+
+def _chat_voice(chat_id) -> str:
+    """The voice for this chat: this session's choice, else the persisted choice, else default.
+
+    The choice used to live only in memory, so every redeploy silently reset it back to the
+    default - now it is stored in memory.py and survives restarts.
+    """
+    v = CHAT_VOICE.get(chat_id)
+    if v:
+        return v
+    if MEM is not None:
+        try:
+            v = (MEM.get_chat(chat_id) or {}).get("voice")
+        except Exception:  # noqa: BLE001
+            v = None
+    if v:
+        CHAT_VOICE[chat_id] = v
+        return v
+    return TTS_VOICE
+
+
+def _set_chat_voice(chat_id, name: str) -> None:
+    """Remember the voice for this chat, in memory AND on disk."""
+    CHAT_VOICE[chat_id] = name
+    if MEM is not None:
+        try:
+            MEM.set_chat_flag(chat_id, "voice", name)
+        except Exception as e:  # noqa: BLE001
+            log.debug("voice persist failed: %s", e)
 
 
 def _voice_requested(text: str) -> bool:
@@ -1204,7 +1246,11 @@ async def tts_wav(text: str, lang: str = "english", model=None, voice=None):
     order = ([model] + [x for x in TTS_MODELS if x != model]) if model else list(TTS_MODELS)
     for m in order:
         try:
+            # Short, constant style. A per-voice tweak (if any) wins, otherwise the language
+            # default. Google's guide: keep this SHORT and reuse the SAME string - long or
+            # varied style text is the main cause of voice drift.
             style = TTS_STYLE_HI if lang in ("hindi", "hinglish") else TTS_STYLE
+            style = VOICE_STYLE.get(voice or "", style)
             if "3.8" in m or "3.9" in m or m.startswith("gemini-4"):
                 part = types.Part(text=spoken,
                                   speech_metadata=types.SpeechMetadata(style=style))
@@ -1221,9 +1267,9 @@ async def tts_wav(text: str, lang: str = "english", model=None, voice=None):
                         response_modalities=["AUDIO"],
                         speech_config=types.SpeechConfig(
                             language_code=lang_code,
-                            voice_config=types.VoiceConfig(
-                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                    voice_name=voice or TTS_VOICE))),
+                            # VoiceConfig.voice accepts BOTH a prebuilt name ("Sulafat") and a
+                            # designed custom id ("voice_..."), so one path covers everything.
+                            voice_config=types.VoiceConfig(voice=voice or TTS_VOICE)),
                     ),
                 ),
                 timeout=TTS_TIMEOUT,
@@ -1325,7 +1371,7 @@ async def send_voice_full(bot, chat_id: int, text: str, lang: str) -> int:
         return 0
     spoken = await transliterate_for_tts(spoken, lang)
     chunks = merge_short(chunk_for_tts(spoken, TTS_CHUNK))[:TTS_MAX_NOTES]
-    voice = CHAT_VOICE.get(chat_id) or TTS_VOICE
+    voice = _chat_voice(chat_id)
     model, sent = CHAT_TTS_MODEL.get(chat_id), 0   # sticky model -> same voice as last reply
     for ch in chunks:
         wav, used = await tts_wav(ch, lang, model=model, voice=voice)
@@ -2037,6 +2083,7 @@ HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
         "/memory - what I remember (owner sees all)\n"
         "/proactive on|off - let me send useful ideas on my own\n"
         "/voicepreview <name> - hear a voice before setting it\n"
+        "/voicecreate <desc> - design a custom voice (owner)\n"
         "/myphoto - describe my profile picture\n/logo - describe your logo\n"
         "/id - your Telegram ID\n/clear - clear chat memory\n\n"
         "💡 Send text, a photo, a voice note or a PDF - the AI replies in your language.")
@@ -2182,22 +2229,25 @@ async def cmd_memory(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_setvoice(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     cid = u.effective_chat.id
-    name = (c.args[0].strip().capitalize() if c.args else "")
+    raw = (c.args[0].strip() if c.args else "")
+    # "voice_..." is a custom designed voice id - keep it exactly as given.
+    name = raw if raw.startswith("voice_") else raw.capitalize()
     if not name:
-        cur = CHAT_VOICE.get(cid) or TTS_VOICE
-        top = "Aoede, Sulafat, Achird, Leda, Vindemiatrix, Achernar, Kore, Charon"
+        cur = _chat_voice(cid)
         await u.message.reply_text(
             f"🎙 Current voice: *{cur}*.\nChange with `/setvoice <name>`.\n"
             f"Hear one first with `/voicepreview <name>`.\n\n"
-            f"Good picks: {top}\n\nAll: " + ", ".join(VOICE_NAMES),
+            f"Best picks: {', '.join(TOP_VOICES)}\n\nAll: " + ", ".join(VOICE_NAMES),
             parse_mode="Markdown")
         return
-    if name not in VOICE_NAMES:
-        await u.message.reply_text("❓ Unknown voice. Try: " + ", ".join(list(VOICE_NAMES)[:20]))
+    if name not in VOICE_NAMES and not name.startswith("voice_"):
+        await u.message.reply_text("❓ Unknown voice. Best picks: " + ", ".join(TOP_VOICES) +
+                                   "\nAll: " + ", ".join(VOICE_NAMES))
         return
-    CHAT_VOICE[cid] = name
+    _set_chat_voice(cid, name)
     await u.message.reply_text(
-        f"✅ Voice set to *{name}* ({VOICE_NAMES[name]}). `/voice on` or `/voicemessage` to hear it.",
+        f"✅ Voice set to *{name}* ({VOICE_NAMES.get(name, 'your custom voice')}). "
+        "`/voice on` or `/voicemessage` to hear it.",
         parse_mode="Markdown")
 
 
@@ -2915,14 +2965,18 @@ async def cmd_voicepreview(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         await u.message.reply_text("Voice needs a Gemini key, which is not set.")
         return
     chat_id = u.effective_chat.id
-    name = (c.args[0].strip().capitalize() if c.args else
-            (CHAT_VOICE.get(chat_id) or TTS_VOICE))
-    if name not in VOICE_NAMES:
-        lines = ["Usage: /voicepreview <name>", "", "Voices (name - character):"]
+    raw = (c.args[0].strip() if c.args else "")
+    # A custom designed voice is "voice_..." and must NOT be capitalised.
+    name = raw if (raw.startswith("voice_") or not raw) else raw.capitalize()
+    if not name:
+        name = _chat_voice(chat_id)
+    if name not in VOICE_NAMES and not name.startswith("voice_"):
+        lines = ["Usage: /voicepreview <name>", "", "Best picks: " + ", ".join(TOP_VOICES),
+                 "", "All voices (name - character):"]
         lines += [f"  {v} - {ch}" for v, ch in VOICE_NAMES.items()]
         await u.message.reply_text("\n".join(lines)[:3800])
         return
-    await u.message.reply_text(f"🔊 {name} - {VOICE_NAMES[name]}")
+    await u.message.reply_text(f"🔊 {name} - {VOICE_NAMES.get(name, 'your custom voice')}")
     # A short Devanagari sample: it shows the voice on Hindi, which is what most chat here is.
     sample = "नमस्ते! मैं Linnet हूँ। आप कैसे हैं? मैं आपकी मदद के लिए यहाँ हूँ।"
     wav, _ = await tts_wav(sample, "hindi", voice=name)
@@ -2930,6 +2984,87 @@ async def cmd_voicepreview(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         await u.message.reply_text("Could not generate that sample - try again in a moment.")
         return
     await send_voice_reply(c.bot, chat_id, wav)
+
+
+async def cmd_voicecreate(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: design a brand-new voice from a description and start using it.
+
+    Google's TTS guide recommends exactly this - "design personas upfront in Voice design"
+    instead of long style blocks, because a stored voice id is the most stable way to keep
+    one identity across every reply.
+    """
+    if client is None:
+        await u.message.reply_text("Voice needs a Gemini key, which is not set.")
+        return
+    if not is_owner(u.effective_user):
+        await u.message.reply_text("That command is owner-only.")
+        return
+    desc = " ".join(c.args).strip() if c.args else ""
+    if not desc:
+        await u.message.reply_text(
+            "Usage: /voicecreate <description>\n\n"
+            "Example:\n/voicecreate a warm, bright young woman's voice - friendly, clear and "
+            "natural, with a soft smile in the tone and easy conversational pacing")
+        return
+    await u.message.reply_text("🎨 Designing the voice... this can take 10-20s.")
+    try:
+        v = await asyncio.wait_for(
+            client.aio.voices.create(
+                voice={"type": "prompted",
+                       "prompted": {"input": desc},
+                       "display_name": "Linnet custom",
+                       "description": desc[:200]},
+                store=True),
+            timeout=90)
+    except Exception as e:  # noqa: BLE001
+        log.warning("voice create failed: %s", str(e)[:200])
+        await u.message.reply_text(
+            "Voice design failed: " + str(e)[:300] +
+            "\n\n(If it mentions PERMISSION_DENIED or not available, this needs a paid key.)")
+        return
+    vid = getattr(v, "id", None) or getattr(v, "name", None)
+    if not vid:
+        await u.message.reply_text("No voice id came back, so nothing was changed.")
+        return
+    _set_chat_voice(u.effective_chat.id, str(vid))
+    await u.message.reply_text(
+        f"✅ Custom voice created and set for this chat.\nID: {vid}\n"
+        "Send /voicepreview to hear it, or /setvoice Sulafat to go back.")
+    # Prefer Google's own preview audio; fall back to synthesizing a short line.
+    wav = None
+    sa = getattr(v, "sample_audio", None)
+    data = getattr(sa, "data", None) if sa is not None else None
+    if data:
+        try:
+            wav = data if isinstance(data, (bytes, bytearray)) else base64.b64decode(data)
+            wav = bytes(wav)
+        except Exception:  # noqa: BLE001
+            wav = None
+    if not wav:
+        wav, _ = await tts_wav("नमस्ते! मैं Linnet हूँ। ये मेरी नई आवाज़ है।", "hindi", voice=str(vid))
+    if wav:
+        await send_voice_reply(c.bot, u.effective_chat.id, wav)
+
+
+async def cmd_voicelist(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: list the custom voices stored in this project."""
+    if client is None or not is_owner(u.effective_user):
+        await u.message.reply_text("That command is owner-only.")
+        return
+    try:
+        r = await asyncio.wait_for(client.aio.voices.list(page_size=50), timeout=30)
+    except Exception as e:  # noqa: BLE001
+        await u.message.reply_text("Could not list voices: " + str(e)[:200])
+        return
+    mine = []
+    for v in (getattr(r, "voices", None) or []):
+        if (getattr(v, "type", "") or "").lower() in ("prompted", "replicated"):
+            mine.append(f"{getattr(v, 'display_name', '?')} -> {getattr(v, 'id', '?')}")
+    cur = _chat_voice(u.effective_chat.id)
+    body = f"🎙 Current voice here: {cur}\n"
+    body += ("\nYour custom voices:\n" + "\n".join(mine)) if mine else \
+            "\nNo custom voices stored yet - make one with /voicecreate."
+    await u.message.reply_text(body[:3800])
 
 
 async def cmd_proactive(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2968,7 +3103,7 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
              f"🔑 Groq: {bool(GROQ_API_KEY)} (chat fallback + Whisper)",
              f"🖼 Vision: {'on' if client is not None else 'off (no Gemini key)'}",
              f"🔊 TTS: {'on' if client is not None else 'off'} "
-             f"(voice: {CHAT_VOICE.get(u.effective_chat.id) or TTS_VOICE})",
+             f"(voice: {_chat_voice(u.effective_chat.id)})",
              f"🎙 ffmpeg: {'yes' if _ffmpeg_exe() else 'no (voice sent as audio)'}",
              f"🧠 Memory: {LOG_LINES} lines/chat",
              f"🎬 Streaming: {ENABLE_STREAM}",
@@ -3085,6 +3220,8 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("proactive", cmd_proactive))
     app.add_handler(CommandHandler("voicepreview", cmd_voicepreview))
+    app.add_handler(CommandHandler("voicecreate", cmd_voicecreate))
+    app.add_handler(CommandHandler("voicelist", cmd_voicelist))
     app.add_handler(CommandHandler("myphoto", cmd_myphoto))
     app.add_handler(CommandHandler("logo", cmd_logo))
     app.add_handler(CallbackQueryHandler(on_button))
